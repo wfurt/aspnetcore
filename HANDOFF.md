@@ -181,18 +181,28 @@ dotnet src/TlsPoc.LoadClient/bin/Release/net11.0/TlsPoc.LoadClient.dll \
 
 ---
 
-## Azure VM (provisioned, still running)
+## An Azure VM is a workable Linux environment (deleted; recreate if useful)
 
-`tlspoc-lin` / resource group `tlspoc-perf-rg` / westus2 / `Standard_D16s_v5` /
-Ubuntu 24.04, in subscription `.NET Libraries Network Testing`
-(`65be0cba-ce1d-448b-905b-360f13fa5402`). Public IP 20.230.192.189.
+The Linux measurements above were taken on a throwaway Azure VM, since the ASP.NET
+perf lab needs VPN. **Those resources have been deleted.** Recreating one is cheap and
+is a reasonable option if no physical Linux box is available — but see the caveat at
+the end of this section.
 
-Installed: .NET 11 RC2 (`11.0.100-rc.2.26469.104`, matching Windows), `perf` 6.17.13,
-`gdb`, `strace`, coreclr symbols (`libcoreclr.so.dbg`), `perf_event_paranoid=-1`.
+```bash
+az group create -n tlspoc-perf-rg -l westus2
+az vm create -g tlspoc-perf-rg -n tlspoc-lin --image Ubuntu2404 \
+  --size Standard_D16s_v5 --admin-username azureuser --generate-ssh-keys \
+  --os-disk-size-gb 64 --public-ip-sku Standard --nsg-rule SSH
+```
 
-**SSH does not work from the corp network** — outbound TCP is blocked on 22 *and* 443
-(no proxy variables set; PowerShell's HTTPS goes through a system proxy, raw TCP does
-not). Drive it entirely through the agent channel:
+`Standard_D16s_v5` is 8 physical cores x 2 SMT. Provision with: .NET 11 RC2
+(`dotnet-install.sh --version 11.0.100-rc.2.26469.104`), `strace`, `gdb`,
+`linux-tools-azure` (real `perf`), `dotnet-symbol` for `libcoreclr.so.dbg`, and
+`sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0`.
+
+**SSH did not work from the corp network** — outbound TCP was blocked on 22 *and* 443
+(no proxy variables set; PowerShell's HTTPS goes via a system proxy, raw TCP does not).
+Everything was driven through the agent channel instead:
 
 ```powershell
 az vm run-command invoke -g tlspoc-perf-rg -n tlspoc-lin `
@@ -207,8 +217,11 @@ run-command gotchas:
   on the VM and run the file;
 * source transfer works by inlining a base64 tarball in the script (76 KB -> 102 KB).
 
-Cleanup when done:
-`az group delete -n tlspoc-perf-rg --yes` (or `az vm deallocate -g tlspoc-perf-rg -n tlspoc-lin`).
+Teardown: `az group delete -n tlspoc-perf-rg --yes`.
+
+**Caveat:** a single VM running both server and load client is what defeated this
+investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, use two
+(separate load generator) and pin the server to non-sibling CPUs.
 
 ---
 
