@@ -1,0 +1,86 @@
+imports:
+  - https://raw.githubusercontent.com/dotnet/crank/main/src/Microsoft.Crank.Jobs.Bombardier/bombardier.yml
+
+jobs:
+  tlsserver:
+    sources:
+      app:
+        localFolder: app
+    project: app/src/TlsPoc.CrankServer/TlsPoc.CrankServer.csproj
+    readyStateText: Application started.
+    framework: net11.0
+
+scenarios:
+  # Kestrel's TLS layer today: SslStream over a DuplexPipeStream shim.
+  sslstream:
+    application:
+      job: tlsserver
+      environmentVariables:
+        TLS_MODE: sslstream
+        SERVER_PORT: 5000
+    load:
+      job: bombardier
+      variables:
+        serverScheme: https
+        serverPort: 5000
+        path: /
+
+  # PoC: TlsBufferSession driven directly on the connection's pipes.
+  tlssession:
+    application:
+      job: tlsserver
+      environmentVariables:
+        TLS_MODE: tlssession
+        SERVER_PORT: 5000
+    load:
+      job: bombardier
+      variables:
+        serverScheme: https
+        serverPort: 5000
+        path: /
+
+  # Connection-churn variants: "Connection: close" forces a new TCP+TLS connection per
+  # request, so the per-handshake cost dominates instead of being amortised over keep-alive.
+  sslstream-churn:
+    application:
+      job: tlsserver
+      environmentVariables:
+        TLS_MODE: sslstream
+        SERVER_PORT: 5000
+    load:
+      job: bombardier
+      variables:
+        serverScheme: https
+        serverPort: 5000
+        path: /
+        transport: http1
+        customHeaders:
+          - 'Connection: close'
+
+  tlssession-churn:
+    application:
+      job: tlsserver
+      environmentVariables:
+        TLS_MODE: tlssession
+        SERVER_PORT: 5000
+    load:
+      job: bombardier
+      variables:
+        serverScheme: https
+        serverPort: 5000
+        path: /
+        transport: http1
+        customHeaders:
+          - 'Connection: close'
+
+profiles:
+  local:
+    variables:
+      serverAddress: localhost
+    jobs:
+      application:
+        endpoints:
+          - http://localhost:5010
+      load:
+        endpoints:
+          - http://localhost:5010

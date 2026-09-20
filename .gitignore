@@ -1,0 +1,14 @@
+# Repo-local .NET 11 RC2 SDK (~1 GB), acquired with dotnet-install
+.dotnet/
+
+# Build output
+bin/
+obj/
+artifacts/
+BenchmarkDotNet.Artifacts/
+
+# Staged trimmed copy used for crank lab runs; re-created with robocopy from src/
+crank/app/
+
+# Stray console redirects
+*.log

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>TlsPoc.ServerCost</RootNamespace>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TlsPoc.Core\TlsPoc.Core.csproj" />
+  </ItemGroup>
+
+</Project>
