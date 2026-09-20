@@ -11,35 +11,70 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ## TL;DR
 
-* **Windows: a real win, independently verified.** +6–10% RPS in the ASP.NET perf lab
-  via crank, across three sweeps at 2/4/8 cores, at equal CPU.
-* **Linux: works and can reach full parity, but is unstable.** One run measured dead
-  parity with `SslStream`; most runs land ~50–60% of it. Root cause of the slow state
-  is **not** found. This is the open item.
-* The design itself is not the problem: at 1 connection the PoC is the fastest of the
-  three modes, and the middleware has been positively exonerated (see below).
+* **Both platforms are a win, crank-verified against the perf lab after the fix:**
+  **Linux +8–9%** and **Windows +13–14%** at 2/4/8 cores, with better p99 latency, equal
+  or slightly less CPU, and zero bad responses. On the whole 56-core machine it is
+  parity — something other than TLS is the limit there.
+* **Linux used to lose 30–57%, and that was a deadlock, not slowness.**
+  `TlsBufferSession` buffers ciphertext internally. When the client's first request
+  arrived coalesced with its final handshake flight, the request ended up inside the
+  session while the reader blocked on the transport for bytes already consumed. The
+  connection deadlocked until the client timed out, closed and reconnected — producing a
+  handshake storm that burned the "missing" CPU.
+* The fix is `TlsPipeReader.TryDrainSession()`: drain plaintext the session already holds
+  before blocking on the transport. Slow path only.
+* The old "bimodal / 50–60% of SslStream / intermittent 0 rps" observations were all this
+  defect, amplified by WSL and shared-VM measurement error.
+* Windows was previously measured at +6–10% *before* this fix existed; the deadlock hit
+  Windows too, which is why the numbers are now higher.
 
 ---
 
 ## Results and provenance
 
-Provenance matters — only the lab numbers are independent.
+All numbers below are **crank**, run against the ASP.NET perf lab with a separate load
+generator, after the buffered-input fix. Each point is 2 runs per mode; medians shown.
+Spread within a point was under 1.5% on Windows and under 2% on Linux.
+
+### Head-to-head, `sslstream` vs `tlssession`
+
+| cores | Linux ssl | Linux tls | **Linux** | Windows ssl | Windows tls | **Windows** |
+|---|---|---|---|---|---|---|
+| 2 | 112,174 | 122,749 | **+9.4%** | 96,328 | 108,608 | **+12.7%** |
+| 4 | 199,586 | 215,574 | **+8.0%** | 176,698 | 201,447 | **+14.0%** |
+| 8 | 329,065 | 356,752 | **+8.4%** | 317,537 | 359,990 | **+13.4%** |
+| 56 (whole machine) | 727,236 | 728,515 | +0.2% | not measured | | |
+
+Zero bad responses in every run. The PoC also wins on latency and uses equal or slightly
+less CPU at every point — e.g. Windows 8 cores: p99 **1.31 ms vs 1.56 ms** at 741% vs
+764% CPU; Linux 4 cores: p99 **3.00 ms vs 3.15 ms** at 386% vs 396%.
+
+**The whole-machine result is parity, not a win.** At 56 cores both modes land in a noisy
+720k–800k band (three iterations each, medians 727k vs 729k), so something other than the
+TLS layer is the limit there. Constrain the server and the win appears consistently. An
+earlier single 56-core run showing +14.4% was inside that noise band and should not be
+quoted.
+
+### Other measurements (pre-fix, still valid)
 
 | Measurement | Result | Source |
 |---|---|---|
-| Windows lab, 2 / 4 / 8 cores | **+7.3/8.2/8.4%**, **+8.1/9.2/10.6%**, **+5.7/6.2/7.0%** | **crank**, `aspnet-gold-win`, 3 sweeps |
-| Windows local, post-`sendmsg` fix, 4 / 8 cores | +14.5% / +15.6% | own harness, shared dev box |
 | Handshake CPU | **−23%** (602 -> 465 kcycles) | `TlsPoc.ServerCost` (QueryThreadCycleTime) |
 | Round-trip CPU | **−10%** (151.8 -> 136.4 kcycles) | `TlsPoc.ServerCost` |
 | Allocation per connection | **−1.78 KB** (server-attributable) | BenchmarkDotNet pairing matrix |
-| Linux (Azure VM), 2 physical cores, 128 conns | ssl 59.7k / 60.5k vs tls 36.2k / 29.1k | own harness |
-| Linux, best observed run | **51,161 @ 36.3 us/req vs ssl 50,250 @ 37.2 us — parity** | own harness |
 
-The local Windows post-fix numbers are NOT independently verified — the perf lab needs
-VPN, which was unavailable. Between-round drift on the dev box is +5%..+19%, so the
-defensible claim is "+6–10%, crank-verified".
+### What the fix changed on Linux
 
----
+Pre-fix lab numbers, for the record — the PoC was losing badly because of the deadlock,
+not because it was slow (single runs, `--application.cpuSet`):
+
+| cores | ssl | tls before | tls after |
+|---|---|---|---|
+| 2 | 113,873 | 65,147 | 122,948 |
+| 4 | 196,147 | 100,268 | 213,323 |
+| 8 | 324,915 | 228,923 | 350,046 |
+| 16 | 541,379 | 250,232 | 620,742 |
+
 
 ## The one fix that came out of the investigation
 
@@ -55,56 +90,73 @@ Platform-independent; appears to be worth roughly 5 points on Windows.
 
 ---
 
-## Linux: what is actually happening
+## Linux: the deadlock, and how it was found
 
-Behaviour is **bimodal**, not uniformly slow. Eight identical runs at 128 connections:
+### Root cause
 
-* slow cluster (5 runs): 23.9k–27.1k rps, 62–70 us/req
-* fast cluster (3 runs): 34.8k–38.3k rps, 41.7–46.5 us/req
+`TlsBufferSession` buffers ciphertext **inside the session**. If the client's first
+request arrives in the same TCP segment as its final handshake records - which is normal
+for TLS 1.3 and gets more likely under load - the session consumes the whole segment
+during the handshake and holds the request internally.
 
-The fast state uses **less** CPU and delivers **more** throughput. With correct
-physical-core pinning the PoC runs at 50–60% of `SslStream` while using less CPU
-(1.47 of 2 cores vs 1.85) — it cannot fill the machine. `ThreadNative_SpinWait`
-(thread-pool spin-before-park) is 30–49% of samples, but it is a **symptom**: setting
-the spin limit to 0 removes the frame and does not change throughput.
+`TlsSessionDuplexPipe`'s reader then saw an empty transport buffer and awaited
+`_transport.Input.ReadAsync`. Nothing more was coming: the bytes had already been read
+off the socket and were sitting in the session. The server waited for a request it
+already had, the client waited for a response, and the connection deadlocked until the
+client's timeout (10 s max latency in every single lab run, at every core count).
 
-Occasionally a run returns **0 rps** outright. Seen in WSL and once on the VM. This is
-a separate, real robustness bug and has not been investigated.
+The API makes this easy to get wrong: there is `DrainPendingOutput` for buffered output,
+but **no equivalent for buffered input** and no way to ask whether the session is holding
+any. Worth raising against the sans-IO API - `TlsBufferSession` is `[Experimental]`.
 
-### Positively exonerated
+### The fix
 
-`TLS_MODE=sslpipe` runs `SslStream` inside the *same* custom middleware and the same
-`IDuplexPipe` swap. It matches Kestrel's `UseHttps` exactly (49,564 vs 49,955 @ 32
-conns), so the middleware, the `connection.Transport` swap, the pipe indirection and
-the harness are all fine. The defect is inside `TlsSessionDuplexPipe`.
+`TlsPipeReader.TryDrainSession()` pulls plaintext the session already holds, by calling
+`Read` with an empty source, and the reader now does that **before** blocking on the
+transport. It only runs on the slow path, so the hot path is unchanged.
 
-### Ruled out as the cause (all measured, all negative)
+### Why it cost so much throughput
 
-Shared `TlsContext` (sharding over 2/8/32 contexts and per-connection contexts change
-nothing — and separate contexts would kill TLS resume anyway); OpenSSL locking (108
-sampled threads, zero `libssl` frames, zero mutex waits); handshake churn (32 ESTAB
-sockets start and end); syscall counts (recvfrom 2.004 vs 2.013, sendto 1.002 vs 1.038
-per request); allocation (1,877 vs 2,160 B/req); thread-pool hand-offs (2.51 vs 2.55
-per request); managed lock contention (~0 both); thread-pool size; JIT tiering
-(`TieredCompilation=0` made both worse); `IOQueueCount`;
-`DOTNET_SYSTEM_NET_SOCKETS_THREAD_COUNT`; inline socket completions;
-`UnsafePreferInlineScheduling`; the load client (2.0–2.6 cores used in both modes,
-14 cores available).
+A deadlocked connection was killed by the client and replaced, so the server paid for a
+fresh handshake instead of serving requests. At 256 connections on 2 cores:
 
-### Best remaining lead
+| | before | after |
+|---|---|---|
+| rps | 53,434 | **62,695** |
+| max latency | 10.37 s | **206 ms** |
+| latency stddev | 194 ms | **2.48 ms** |
+| timeouts | 498 | **0** |
+| connections created (256 configured) | 3,062 | **258** |
+| reads per connection | 1.0 | **7,338** |
 
-In the resolved inclusive tree, `Task.RunContinuations` (27.25%) and
-`AwaitTaskContinuation.RunOrScheduleAction` (27.14%) are hot in the PoC and absent
-from `SslStream`'s top frames. `RunOrScheduleAction` is the "cannot run inline, queue
-it to the thread pool" path. Meanwhile `ThreadPoolWorkQueue.Dispatch` is 53% for the
-PoC vs 90% for `SslStream`. Consistent with: same work-items/request but a drained
-queue, park/wake churn, and spin.
+That handshake storm is exactly the "uses less CPU but cannot fill the machine" symptom:
+stalled connections generate no work, so the thread pool drained and parked.
 
-The diff that was never completed: capture a fast-state and a slow-state profile
-**back to back in one run** and diff them against each other rather than against
-`SslStream`. The last attempt failed because no fast state occurred in that batch.
+### How it was isolated (useful next time)
 
----
+1. Bad responses and a 10 s max latency reproduced in the lab, not just locally, which
+   killed the "WSL/shared-VM artefact" theory.
+2. `TLS_MODE=sslpipe` (SslStream in the *same* middleware and pipe swap) was clean:
+   0 errors, 223 ms max. That exonerated the middleware and the transport swap.
+3. Raising Kestrel's log level to Debug showed its slowest request was **56 ms** while
+   the client saw 10 s - so the lost time was never inside request processing.
+4. Temporary instrumentation in the adapter (since removed) showed connections closing
+   after a single read following a clean handshake exit
+   (`complete=True leftover=0 pendingOut=False`), and stalled sockets had `Recv-Q=0`.
+5. The giveaway was `consumed=24 produced=62`: 62 bytes of plaintext out of a 24-byte
+   input is only possible if the session was already holding ciphertext. 62 bytes is a
+   bombardier GET, which as a TLS record is 84 bytes - the `Recv-Q=84` seen earlier.
+
+A red herring worth recording: server sockets sitting at `Recv-Q=84` looked like a
+smoking gun until the `SslStream` control showed the same thing. It is ordinary
+backpressure at 2 cores. Always run the control.
+
+### Still open
+
+At 28 cores the post-fix run came out 5.6% behind; every other point is 8–15% ahead.
+Given ~±10% run-to-run drift at high core counts this is probably noise, but it has not
+been replicated.
+
 
 ## Measurement traps (each of these produced a wrong conclusion here)
 
@@ -227,15 +279,63 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
 
 ## Next steps
 
-1. Get onto a **physical Linux box with a separate load generator**. Client contention
-   and machine drift are what defeated the investigation on the shared Azure VM;
-   identical configs there ranged 12.5k–51.2k rps.
-2. Re-baseline the A/B with correct physical-core pinning before anything else.
-3. Do the fast-vs-slow state diff in a single run.
-4. Investigate the intermittent 0-rps failure — it may be the same bug.
-5. Re-run the Windows lab sweep post-`sendmsg`-fix to confirm whether the win is now
-   above +10%.
+1. Raise the buffered-input gap against the sans-IO TLS API: there is no way to ask
+   whether `TlsBufferSession` is holding ciphertext, and no input counterpart to
+   `DrainPendingOutput`. Any other consumer will hit the same deadlock, so this is worth
+   filing while the API is still `[Experimental]`.
+2. Work out what limits the whole-machine (56-core) case, where both TLS layers land at
+   the same ~727k rps. The win is consistent whenever the server is core-constrained, so
+   the ceiling there is probably the load generator or the network, not Kestrel.
+3. Re-run the churn scenarios (`sslstream-churn` / `tlssession-churn`) now that
+   connection reuse works; they were measuring the bug.
+4. Add a regression test for the coalesced case: a client that sends its first request in
+   the same flight as its final handshake records must not stall.
 
 Known gaps if this ever ships: the middleware bypasses `HttpsConnectionMiddleware`, so
 Kestrel's TLS counters and `ITlsHandshakeFeature` are lost. Integration into
 dotnet/aspnetcore is also blocked while that repo pins a .NET 10 SDK.
+
+---
+
+## Reproducing the Linux measurements
+
+The lab is reachable from outside the corp network through the Azure Relay profiles
+(`aspnet-gold-lin-relay`), authenticated with `az login` — no VPN and no connection
+string needed:
+
+```bash
+crank --config crank/tlspoc.benchmarks.yml \
+      --config https://raw.githubusercontent.com/aspnet/Benchmarks/main/scenarios/aspnet.profiles.yml \
+      --scenario tlssession --profile aspnet-gold-lin-relay --relay \
+      --application.cpuSet "0-7"
+```
+
+`crank/app/` is a staged copy of the sources and is gitignored; recreate it before a run:
+
+```bash
+rm -rf crank/app && mkdir -p crank/app/src
+rsync -a --exclude bin --exclude obj src/TlsPoc.CrankServer src/TlsPoc.Core crank/app/src/
+cp Directory.Build.props global.json crank/app/
+```
+
+Gotchas:
+
+* The job sets `SERVER_BIND: any`. Without it the server binds to loopback, every lab
+  profile reports **100% bad responses**, and crank still prints a plausible-looking rps.
+* `--application.cpuSet` needs cgroup tools on the agent. It works on the lab machines;
+  on a dev box without `cgcreate` the job fails, so pin with `taskset` instead.
+* SMT topology differs per machine — check
+  `/sys/devices/system/cpu/cpu0/topology/thread_siblings_list` before assuming that
+  `taskset -c 0,1` is one physical core or two. On the Xeon E5-1650 v4 the siblings are
+  `(0,6) (1,7) ...`, so `0,1` really is two physical cores.
+* `crank-agent` targets .NET 8; do not run it with `DOTNET_ROOT` pointed at the repo's
+  .NET 11 SDK.
+
+### If the stall ever comes back
+
+The instrumentation used to find it was temporary and has been removed. What identified
+it quickly: a per-connection watchdog reporting connections stuck in one state for more
+than ~700 ms, counters for handshakes and per-connection reads, and the `consumed`/
+`produced` values from `TlsBufferSession.Read`. `TLS_MODE=sslpipe` is the control that
+separates the adapter from the middleware, and Kestrel at Debug level tells you whether
+time is being lost inside request processing or before it.

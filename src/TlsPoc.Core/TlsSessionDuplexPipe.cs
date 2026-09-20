@@ -337,6 +337,16 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
         {
             while (_end <= _examined && !_completed && !_canceled)
             {
+                // TlsBufferSession buffers ciphertext internally, so records that arrived
+                // coalesced with an earlier flight - typically the first request riding along
+                // with the client's final handshake records - are already inside the session
+                // with nothing left in the transport to wake us. Blocking on the transport
+                // here deadlocks until the peer gives up, so drain the session first.
+                if (TryDrainSession())
+                {
+                    break;
+                }
+
                 var result = await owner._transport.Input.ReadAsync(cancellationToken);
                 var buffer = result.Buffer;
 
@@ -437,6 +447,53 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
             {
                 ArrayPool<byte>.Shared.Return(_plaintext);
                 _plaintext = null;
+            }
+        }
+
+        /// <summary>
+        /// Pulls plaintext the session already holds, without asking the transport for more.
+        /// Returns true when data was produced or the session reported closure.
+        /// </summary>
+        private bool TryDrainSession()
+        {
+            var drained = false;
+            var escalated = false;
+
+            while (true)
+            {
+                EnsureCapacity(escalated ? MaxPlaintextRecord : InitialBufferSize);
+
+                var status = owner._session.Read(
+                    ReadOnlySpan<byte>.Empty,
+                    _plaintext.AsSpan(_end),
+                    out _,
+                    out var produced);
+
+                _end += produced;
+                drained |= produced > 0;
+
+                if (status == TlsOperationStatus.Closed)
+                {
+                    _completed = true;
+                    return true;
+                }
+
+                if (status != TlsOperationStatus.DestinationTooSmall)
+                {
+                    return drained;
+                }
+
+                if (produced == 0)
+                {
+                    // A whole record could not fit. Grow once; if that still does not help,
+                    // fall back to the transport rather than spinning here.
+                    if (escalated)
+                    {
+                        return drained;
+                    }
+
+                    escalated = true;
+                }
             }
         }
 

@@ -9,6 +9,11 @@ jobs:
     project: app/src/TlsPoc.CrankServer/TlsPoc.CrankServer.csproj
     readyStateText: Application started.
     framework: net11.0
+    environmentVariables:
+      # The server binds to loopback unless told otherwise; every lab profile drives
+      # load from a separate machine, so without this all responses are connection
+      # failures and the run silently reports a meaningless rps.
+      SERVER_BIND: any
 
 scenarios:
   # Kestrel's TLS layer today: SslStream over a DuplexPipeStream shim.
