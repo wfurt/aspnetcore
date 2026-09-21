@@ -16,6 +16,9 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
   **−0.5%** on Windows. The larger figures below (+13–14% Windows) are from
   *core-constrained* runs; the margin depends on the server being the bottleneck, and both
   framings belong together.
+* On the same standard scenario with the server core-constrained to 8 cores (medians of 3
+  runs): **Linux +8.8%**, **Windows +8.3%**. The Linux point is noisy (+5 to +11% across
+  runs); Windows is stable to 0.4%.
 * On the custom scenarios here (`sslstream` vs `tlssession`, bombardier, 256 connections,
   13-byte response): **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores, with lower p99
   latency and equal or slightly lower CPU. Zero bad responses throughout.
@@ -104,23 +107,32 @@ standard scenario can be run twice with this PoC's server substituted in, once p
 layer. This keeps the published load methodology (wrk, `pipeline: 16`, plaintext preset
 headers, `/plaintext`) and only varies the TLS implementation.
 
-**Test:** `plaintext.benchmarks.yml`, scenario `https`, unmodified; application job
-replaced via `--application.source.localFolder`. **Units:** requests/sec.
+### Core-constrained runs of `plaintext https` (supplementary)
+
+Same substitution, with `--application.cpuSet 0-7`. These are supplementary to the
+whole-machine numbers above, which are the tracked configuration.
+
+**Units:** requests/sec, median of 3 runs on the current build.
 
 | platform | server cores | sslstream (req/s) | tlssession (req/s) | Δ |
 |---|---|---|---|---|
-| Linux | 8 | 1,426,765 | 1,577,348 | **+10.6%** |
-| Linux | 56 (whole machine) | 3,248,090 | 3,376,937 | **+4.0%** |
-| Windows | 8 | 1,103,177 | 1,222,503 | **+10.8%** |
-| Windows | 56 (whole machine) | 4,563,672 | 4,652,155 | **+1.9%** |
+| Linux | 8 | 1,422,683 | 1,547,697 | **+8.8%** |
+| Windows | 8 | 1,106,796 | 1,198,127 | **+8.3%** |
 
-Zero bad responses in all runs. CPU was level between the two layers (Linux 8 cores 786%
-vs 787%; Windows 8 cores 785% vs 777%). As with the custom scenarios, the margin is
-largest when the server is core-constrained and shrinks on the whole machine, where
-something other than the TLS layer limits throughput.
+**The Linux point is noisy — treat single runs of it as unusable.** Across three identical
+iterations `tlssession` spanned 1,491,228–1,574,370 (5.6%) while `sslstream` spanned only
+2.3%, giving per-run deltas of +7.0%, +10.7% and +8.5%; a fourth run gave +5.5%. So the
+honest range there is roughly +5 to +11%. Windows was far more stable: 0.4% spread on
+`tlssession`, per-run deltas of +8.0%, +8.8% and +7.2%.
 
-Do not quote latency from this scenario: wrk with pipelining reports p99 as `0.00` in
-several of these runs, so only the request rate is meaningful here.
+Earlier single runs of this configuration measured +10.6% (Linux) and +10.8% (Windows).
+Both were optimistic samples, and the Linux one briefly looked like a regression when the
+current build first measured +5.5%. Neither was real: they sit inside the same spread.
+Anything quoted from this configuration needs at least three runs. CPU was level between
+the layers (Linux 782% vs 777%).
+
+Do not quote latency from this scenario either: wrk with pipelining reports p99 as `0.00`
+in several runs, so only the request rate is meaningful.
 
 ```bash
 crank --config https://raw.githubusercontent.com/aspnet/Benchmarks/main/scenarios/plaintext.benchmarks.yml \
