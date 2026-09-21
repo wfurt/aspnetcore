@@ -55,6 +55,52 @@ TLS layer is the limit there. Constrain the server and the win appears consisten
 earlier single 56-core run showing +14.4% was inside that noise band and should not be
 quoted.
 
+### Response size sweep — where the win comes from
+
+`aspnet-gold-lin`, 8 cores, bombardier 256 connections, `--variable responseSize=N`:
+
+| response | ssl rps | tls rps | Δ | tls throughput |
+|---|---|---|---|---|
+| 13 B (default) | 325,762 | 340,638 | **+4.6%** | 68 MB/s |
+| 1 KB | 344,209 | 367,995 | **+6.9%** | 414 MB/s |
+| 16 KB | 203,619 | 224,445 | **+10.2%** | 3,548 MB/s |
+| 100 KB | 45,411 | 45,471 | +0.1% | 4,456 MB/s |
+
+The gain peaks at 16 KB — one maximum-size TLS record per response, where avoiding
+`SslStream`'s two buffer copies saves the most per operation.
+
+The 100 KB row is **not** evidence that the win disappears in bulk transfer: both layers
+land on 4,456 MB/s, which is about 35.6 Gbps, i.e. the network link. The benchmark cannot
+discriminate at that size; it would need a faster link or a loopback setup to say anything.
+
+### Handshake cost — no trustworthy number yet
+
+The `*-churn` scenarios are **not** currently a valid handshake benchmark and their numbers
+should not be quoted. Three separate attempts were all confounded:
+
+1. With TLS resumption on (the original default), `openssl s_client -reconnect` shows every
+   reconnect is resumed. A resumed handshake does no signature, which is why swapping
+   RSA-2048 for ECDSA P-256 moved `sslstream` by only 3.8% — the measurement never touched
+   handshake cost. `tls-handshakes-kestrel` in aspnet/Benchmarks disables resumption for
+   exactly this reason; this config had simply omitted it.
+2. With resumption disabled (`TLS_RESUME=0`, now wired up), the lab produced internally
+   inconsistent results — `sslstream` at 16 rps with 6.16 ms mean latency, and ECDSA
+   slower than RSA. That is a broken run, not a slow one, and is unexplained.
+3. Locally, `openssl s_time -new` is a single sequential client, so it is round-trip bound
+   and mixes in client-side verification, where the algorithm costs run the *opposite* way
+   to the server's. It reports RSA-2048 as faster than ECDSA P-256, which is the giveaway.
+
+The only defensible handshake figure remains `TlsPoc.ServerCost` (−23% server CPU cycles),
+because it measures server-only CPU directly rather than inferring it from a rate. Note it
+was taken on Windows with an ECDSA P-256 certificate.
+
+To get a publishable handshake rate, port this PoC's TLS layer into the standard app
+(`src/BenchmarksApps/TLS/Kestrel` in aspnet/Benchmarks) and run the standard
+`tls-handshakes-kestrel` scenario against it — crank can upload a modified local copy with
+`--application.source.localFolder` plus `--application.project`. That keeps the published
+baseline's methodology, including its resumption handling. The app targets net9.0 today and
+would need retargeting to net11.0 for the sans-IO APIs.
+
 ### Other measurements (pre-fix, still valid)
 
 | Measurement | Result | Source |

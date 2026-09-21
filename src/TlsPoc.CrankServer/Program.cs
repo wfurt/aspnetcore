@@ -18,7 +18,9 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("SERVER_PORT"), out v
 var bindAny = string.Equals(Environment.GetEnvironmentVariable("SERVER_BIND"), "any", StringComparison.OrdinalIgnoreCase);
 var perConnectionCtx = Environment.GetEnvironmentVariable("TLS_CTX_PER_CONN") == "1";
 
-var certificate = CertificateFactory.CreateSelfSigned("localhost");
+var certificate = CertificateFactory.CreateSelfSigned(
+    "localhost",
+    algorithm: Environment.GetEnvironmentVariable("CERT_ALG") ?? "ecdsap256");
 
 // Resolved once per endpoint, exactly as Kestrel's HttpsConnectionMiddleware does.
 var certificateContext = SslStreamCertificateContext.Create(certificate, additionalCertificates: null);
@@ -30,6 +32,13 @@ var serverOptions = new SslServerAuthenticationOptions
     ApplicationProtocols = [SslApplicationProtocol.Http11],
     ClientCertificateRequired = false,
 };
+
+// A "Connection: close" benchmark only measures handshake cost if sessions cannot be
+// resumed - a resumed handshake does no signature at all, which is why the certificate
+// algorithm otherwise makes almost no difference. tls-handshakes-kestrel in
+// aspnet/Benchmarks disables resumption for the same reason.
+var allowTlsResume = Environment.GetEnvironmentVariable("TLS_RESUME") != "0";
+serverOptions.AllowTlsResume = allowTlsResume;
 
 TlsContext? tlsContext = mode == "tlssession" ? TlsContext.CreateServer(serverOptions) : null;
 
@@ -96,6 +105,11 @@ builder.WebHost.ConfigureKestrel(options =>
                 // Kestrel resolves this into an SslStreamCertificateContext once per endpoint.
                 httpsOptions.ServerCertificate = certificate;
                 httpsOptions.SslProtocols = SslProtocols.Tls13 | SslProtocols.Tls12;
+
+                if (!allowTlsResume)
+                {
+                    httpsOptions.OnAuthenticate = (_, sslOptions) => sslOptions.AllowTlsResume = false;
+                }
             });
         }
         else if (mode == "sslpipe")
@@ -179,7 +193,28 @@ builder.WebHost.ConfigureKestrel(options =>
 });
 
 var app = builder.Build();
-app.MapGet("/", () => "Hello, World!");
+
+// RESPONSE_SIZE lets the response body be sized so the benchmark can separate per-request
+// overhead (which is what this PoC removes) from bulk record throughput, where the AEAD
+// cost dominates and the TLS layer's own overhead matters much less.
+var responseSize = int.TryParse(Environment.GetEnvironmentVariable("RESPONSE_SIZE"), out var rs) && rs > 0 ? rs : 0;
+
+if (responseSize > 0)
+{
+    var payload = new byte[responseSize];
+    Random.Shared.NextBytes(payload);
+
+    app.MapGet("/", (HttpContext context) =>
+    {
+        context.Response.ContentType = "application/octet-stream";
+        context.Response.ContentLength = payload.Length;
+        return context.Response.Body.WriteAsync(payload, 0, payload.Length);
+    });
+}
+else
+{
+    app.MapGet("/", () => "Hello, World!");
+}
 
 // Crank waits on this text, so it must not be printed until the port is actually open.
 app.Lifetime.ApplicationStarted.Register(() =>

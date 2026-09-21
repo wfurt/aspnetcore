@@ -1,5 +1,18 @@
 imports:
   - https://raw.githubusercontent.com/dotnet/crank/main/src/Microsoft.Crank.Jobs.Bombardier/bombardier.yml
+  - https://raw.githubusercontent.com/dotnet/crank/main/src/Microsoft.Crank.Jobs.HttpClient/httpclient.yml
+
+variables:
+  # Response body size in bytes; 0 keeps the 13-byte "Hello, World!" body. Sweep this to
+  # show where the PoC's per-request saving stops mattering and AEAD throughput takes over.
+  responseSize: 0
+  # Server certificate key: ecdsap256 or rsa2048. Only affects handshake cost, but it
+  # affects it a lot, so any handshake number must state which was used.
+  certAlg: ecdsap256
+  # 0 disables TLS session resumption. Required for any handshake measurement: a resumed
+  # handshake performs no signature, so with resumption on, a "Connection: close" run
+  # measures connection setup rather than handshake cost.
+  tlsResume: 1
 
 jobs:
   tlsserver:
@@ -14,6 +27,9 @@ jobs:
       # load from a separate machine, so without this all responses are connection
       # failures and the run silently reports a meaningless rps.
       SERVER_BIND: any
+      RESPONSE_SIZE: "{{responseSize}}"
+      CERT_ALG: "{{certAlg}}"
+      TLS_RESUME: "{{tlsResume}}"
 
 scenarios:
   # Kestrel's TLS layer today: SslStream over a DuplexPipeStream shim.
@@ -46,37 +62,53 @@ scenarios:
 
   # Connection-churn variants: "Connection: close" forces a new TCP+TLS connection per
   # request, so the per-handshake cost dominates instead of being amortised over keep-alive.
+  #
+  # Configured to match `tls-handshakes-kestrel` in aspnet/Benchmarks
+  # scenarios/tls.benchmarks.yml: httpclient load job, connectionclose preset, 32
+  # connections, RSA-2048 certificate, TLS 1.2. The remaining difference is the app itself -
+  # that scenario runs src/BenchmarksApps/TLS/Kestrel from aspnet/benchmarks, this one runs
+  # TlsPoc.CrankServer so the TLS layer can be swapped. Read these as an A/B between the two
+  # TLS layers, not as a direct substitute for that scenario's published numbers.
+  #
+  # Note 32 connections bounds this: at ~3-6 ms per handshake it is latency-bound well below
+  # the server's capacity, so it compares per-handshake cost rather than peak handshake rate.
   sslstream-churn:
     application:
       job: tlsserver
+      variables:
+        certAlg: rsa2048
+        tlsResume: 0
       environmentVariables:
         TLS_MODE: sslstream
         SERVER_PORT: 5000
     load:
-      job: bombardier
+      job: httpclient
       variables:
         serverScheme: https
         serverPort: 5000
         path: /
-        transport: http1
-        customHeaders:
-          - 'Connection: close'
+        presetHeaders: connectionclose
+        connections: 32
+        sslProtocol: tls12
 
   tlssession-churn:
     application:
       job: tlsserver
+      variables:
+        certAlg: rsa2048
+        tlsResume: 0
       environmentVariables:
         TLS_MODE: tlssession
         SERVER_PORT: 5000
     load:
-      job: bombardier
+      job: httpclient
       variables:
         serverScheme: https
         serverPort: 5000
         path: /
-        transport: http1
-        customHeaders:
-          - 'Connection: close'
+        presetHeaders: connectionclose
+        connections: 32
+        sslProtocol: tls12
 
 profiles:
   local:
