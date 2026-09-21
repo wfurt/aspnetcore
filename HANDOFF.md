@@ -432,6 +432,34 @@ a good argument for running a real application against this layer rather than ju
 benchmark endpoints, and the same class of gap may exist for other `PipeWriter` /
 `PipeReader` members that Kestrel or middleware can reach.
 
+## Correctness verification
+
+`TlsPoc.Probe` covers the session directly (TLS 1.3, SNI, ALPN h2, 512 KiB both ways).
+Beyond that, both TLS layers were compared end-to-end through Kestrel and produce
+byte-identical results:
+
+| check | result |
+|---|---|
+| `/plaintext` | identical |
+| `/json` (`WriteAsJsonAsync`) | identical |
+| `/echo` — 5 MB POST body, FNV hash of the received bytes | **identical hash**, `5000000:924540297` |
+| `/chunked` — 64 × 1 KB writes, no Content-Length | identical length, `Transfer-Encoding: chunked` |
+| server-side exceptions | none in either mode |
+
+The 5 MB upload matters because it drives the reader across many reads and
+`AdvanceTo` cycles, and the chunked response drives the writer with no
+Content-Length. Those were the paths most likely to hide bookkeeping bugs.
+
+`UnflushedBytes` is the only member of `PipeReader`/`PipeWriter` whose base
+implementation throws, so there is no second gap of that kind. The remaining
+surface (`CopyToAsync`, `ReadAtLeastAsync`, `AsStream`, `WriteAsync`) is built on the
+members this adapter overrides.
+
+**Not covered:** the endpoint is configured `HttpProtocols.Http1` and advertises only
+`http/1.1` via ALPN, so **HTTP/2 is never exercised** through this middleware. Client
+certificates and renegotiation are likewise untested through Kestrel, though
+`HandshakeAsync` has parameters for both.
+
 ## Repo layout
 
 ```

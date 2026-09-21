@@ -230,6 +230,38 @@ app.MapGet("/json", (HttpContext context) =>
         new JsonMessage { message = "Hello, World!" },
         AppJsonContext.Default.JsonMessage));
 
+// Correctness endpoints (not used by any benchmark). These exercise paths the plaintext
+// benchmarks never touch: a large request body read through the PipeReader, and a
+// chunked response with no Content-Length written through the PipeWriter.
+app.MapPost("/echo", async (HttpContext context) =>
+{
+    var total = 0L;
+    uint hash = 2166136261;
+    var buffer = new byte[16 * 1024];
+    int read;
+
+    while ((read = await context.Request.Body.ReadAsync(buffer)) > 0)
+    {
+        total += read;
+        for (var i = 0; i < read; i++)
+        {
+            hash = (hash ^ buffer[i]) * 16777619;
+        }
+    }
+
+    return Results.Text($"{total}:{hash}", "text/plain");
+});
+
+app.MapGet("/chunked", async (HttpContext context) =>
+{
+    context.Response.ContentType = "text/plain";
+    for (var i = 0; i < 64; i++)
+    {
+        await context.Response.WriteAsync(new string('x', 1024));
+        await context.Response.Body.FlushAsync();
+    }
+});
+
 // Crank waits on this text, so it must not be printed until the port is actually open.
 app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"Application started. TLS mode: {mode}, port: {port}, bindAny: {bindAny}"));
