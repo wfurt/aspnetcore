@@ -225,6 +225,29 @@ been replicated.
 
 ---
 
+## Why this uses a custom crank config
+
+The benchmarks here are custom (`crank/tlspoc.benchmarks.yml`), not scenarios from
+aspnet/Benchmarks. That is deliberate and worth stating up front, because it is the first
+thing a reviewer will question.
+
+Every standard HTTPS scenario hardcodes `listenOptions.UseHttps(...)`, so it can only ever
+exercise one TLS layer. Comparing `SslStream` against the sans-IO layer needs both
+reachable in the *same* application, over the same transport, cert and load - which is what
+`TLS_MODE` does here (`sslstream` | `sslpipe` | `tlssession`). `sslpipe` exists purely as a
+control: it runs `SslStream` through the identical custom middleware and `IDuplexPipe` swap,
+so any difference it shows is the harness rather than the TLS layer. That three-way
+comparison is not expressible in a standard scenario.
+
+Reusing a standard scenario would mean uploading a patched copy of its app
+(`--application.source.localFolder` does allow this), which trades one custom artefact for
+another while losing the side-by-side control. Standard HTTPS throughput scenarios do exist
+(`plaintext.benchmarks.yml` and `json.benchmarks.yml` have https variants) and are the right
+target once there is a single TLS implementation to measure rather than two to compare.
+
+So: read these numbers as an A/B between two TLS layers under identical conditions, not as
+figures comparable to any published benchmark result.
+
 ## Repo layout
 
 ```
@@ -247,6 +270,9 @@ crank/tlspoc.benchmarks.yml               crank scenarios for the perf lab
 | `SERVER_PORT` | listen port, default 5000 |
 | `SERVER_BIND` | `any` or `localhost` (default; avoids Windows firewall prompts) |
 | `LOG` | `1` keeps Warning-level logging |
+| `RESPONSE_SIZE` | response body size in bytes; `0` (default) keeps `Hello, World!` |
+| `CERT_ALG` | `ecdsap256` (default) or `rsa2048` |
+| `TLS_RESUME` | `0` disables TLS session resumption; required for any handshake measurement |
 | `TLS_CTX_SHARDS` | diagnostic: shard connections over N `TlsContext`s |
 | `TLS_CTX_PER_CONN` | diagnostic: one `TlsContext` per connection |
 | `TLS_IOQ` | sets `SocketTransportOptions.IOQueueCount` |
