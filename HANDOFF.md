@@ -115,6 +115,49 @@ Three things that cost time here:
 * The server must answer the scenario's path, hence the `/plaintext` endpoint in
   `TlsPoc.CrankServer` returning `Hello, World!` as `text/plain`.
 
+### Memory — no win, and a per-connection regression
+
+Two separate questions, with different answers.
+
+**Per-request allocation is unchanged.** From crank counters on the standard `plaintext
+https` scenario, Linux 8 cores, `--application.options.collectCounters true`:
+
+| metric | sslstream | tlssession |
+|---|---|---|
+| requests/sec | 1,397,158 | 1,555,436 |
+| Max allocation rate (B/sec) | 672,552,256 | 749,783,784 |
+| **derived bytes/request** | **481** | **482** |
+| Max GC heap size (MB) | 52 | 31 |
+| GC committed memory (MB) | 54 | 70 |
+| Max time in GC (%) | 7 | 8 |
+
+That is expected: this design removes *per-connection* objects, not per-request ones, so a
+256-connection benchmark cannot show a memory difference. (Heap size vs committed memory
+disagree in direction here, so neither should be quoted on its own.)
+
+**Per-connection footprint is worse, not better.** Measured locally (6-core box, server
+GC, `TlsPoc.LoadClient` holding N connections, RSS sampled 15 s in, minus idle baseline):
+
+| open connections | sslstream (B/conn) | tlssession (B/conn) | delta |
+|---|---|---|---|
+| 1,000 | 125,243 | 151,994 | **+26.8 KB** |
+| 5,000 | 96,932 | 113,715 | **+16.8 KB** |
+| 10,000 | 81,867 | 90,792 | **+8.9 KB** |
+
+The cause is that each connection holds pooled buffers for its whole lifetime:
+`_plaintext` and `_staging` start at `InitialBufferSize` (4 KB) and grow towards
+`MaxPlaintextRecord` (16 KB), and `_scratch` is rented at `MaxCipherRecord` (16.9 KB) the
+first time a read has to be linearised. `ArrayPool` rentals are not *allocations* once the
+pool is warm, which is why the BenchmarkDotNet pairing matrix reports a small allocation
+win (−1.78 KB/connection) while resident memory goes the other way. Both are true; they
+measure different things, and the resident figure is the one that matters at scale.
+
+Caveats: RSS on a server-GC process includes heap slack that is not per-connection state,
+and this is a single local box rather than the lab. The direction is consistent across all
+three connection counts, so it should not be dismissed, but the absolute numbers are soft.
+
+Buffer sizing is the obvious lever if this matters — it has not been tuned.
+
 ### Response size sweep — where the win comes from
 
 **Test:** same scenarios, `aspnet-gold-lin-relay`, `--application.cpuSet 0-7` (8 cores),
@@ -168,7 +211,7 @@ the reference (it disables resumption, which is the part this config originally 
 |---|---|---|
 | Handshake CPU | **−23%** (602 -> 465 kcycles) | `TlsPoc.ServerCost` (QueryThreadCycleTime) |
 | Round-trip CPU | **−10%** (151.8 -> 136.4 kcycles) | `TlsPoc.ServerCost` |
-| Allocation per connection | **−1.78 KB** (server-attributable) | BenchmarkDotNet pairing matrix |
+| Allocation per connection | **−1.78 KB** (server-attributable) — but see "Memory" above: resident memory per connection is *higher* | BenchmarkDotNet pairing matrix |
 
 ### What the fix changed on Linux
 
@@ -432,7 +475,10 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
    the ceiling there is probably the load generator or the network, not Kestrel.
 3. Re-run the churn scenarios (`sslstream-churn` / `tlssession-churn`) now that
    connection reuse works; they were measuring the bug.
-4. Add a regression test for the coalesced case: a client that sends its first request in
+4. Tune per-connection buffer sizing (`InitialBufferSize`, `_scratch` at `MaxCipherRecord`).
+   Resident memory per connection is currently 9–27 KB worse than `SslStream`; nothing here
+   has been tuned for footprint.
+5. Add a regression test for the coalesced case: a client that sends its first request in
    the same flight as its final handshake records must not stall.
 
 ## Platform support and rollout
