@@ -11,22 +11,29 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ## TL;DR
 
-* **Both platforms are a win, crank-verified against the perf lab after the fix:**
-  **Linux +8–9%** and **Windows +13–14%** at 2/4/8 cores, with better p99 latency, equal
-  or slightly less CPU, and zero bad responses. On the whole 56-core machine it is
-  parity — something other than TLS is the limit there.
-* **Linux used to lose 30–57%, and that was a deadlock, not slowness.**
-  `TlsBufferSession` buffers ciphertext internally. When the client's first request
-  arrived coalesced with its final handshake flight, the request ended up inside the
-  session while the reader blocked on the transport for bytes already consumed. The
-  connection deadlocked until the client timed out, closed and reconnected — producing a
-  handshake storm that burned the "missing" CPU.
-* The fix is `TlsPipeReader.TryDrainSession()`: drain plaintext the session already holds
-  before blocking on the transport. Slow path only.
+* **Both platforms are a win.** Scenario `tlssession` vs `sslstream` in
+  `crank/tlspoc.benchmarks.yml`, measured in **requests/sec** (bombardier, 256
+  connections, 13-byte response): **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores,
+  with lower p99 latency (ms), equal or slightly lower CPU (cores%), and zero bad
+  responses. On the whole 56-core machine it is parity — something other than TLS limits
+  it there.
+* **Linux used to lose 30–57% (requests/sec) because of a bug in this adapter, not in the
+  runtime.** `TlsBufferSession` buffers ciphertext internally. When a client's first
+  request arrived coalesced with its final handshake flight, those bytes were consumed
+  into the session during the handshake, and this reader then awaited the transport
+  instead of asking the session. The connection hung until the client timed out and
+  reconnected, producing a handshake storm that burned the "missing" CPU.
+* **The API itself behaves correctly here**: calling `Read` with an empty source returns
+  `produced = 0` when nothing is buffered, so polling the session is cheap and safe. The
+  fix, `TlsPipeReader.TryDrainSession()`, does exactly that before blocking on the
+  transport, on the slow path only. The only API observation worth passing on is that
+  there is no way to *ask* whether the session holds buffered input (there is
+  `DrainPendingOutput` for the output direction), so a consumer has to poll
+  speculatively - worth a line in the docs or a sample, not a defect.
 * The old "bimodal / 50–60% of SslStream / intermittent 0 rps" observations were all this
   defect, amplified by WSL and shared-VM measurement error.
-* Windows was previously measured at +6–10% *before* this fix existed; the deadlock hit
-  Windows too, which is why the numbers are now higher.
+* Windows was previously measured at +6–10% *before* this fix existed; the same hang
+  affected Windows, which is why the numbers are now higher.
 
 ---
 
@@ -36,35 +43,43 @@ All numbers below are **crank**, run against the ASP.NET perf lab with a separat
 generator, after the buffered-input fix. Each point is 2 runs per mode; medians shown.
 Spread within a point was under 1.5% on Windows and under 2% on Linux.
 
-### Head-to-head, `sslstream` vs `tlssession`
+### Head-to-head: scenarios `sslstream` vs `tlssession`
 
-| cores | Linux ssl | Linux tls | **Linux** | Windows ssl | Windows tls | **Windows** |
+**Test:** `crank/tlspoc.benchmarks.yml`, scenarios `sslstream` and `tlssession`, profiles
+`aspnet-gold-lin-relay` / `aspnet-gold-win-relay`, core count set with
+`--application.cpuSet`. Load: bombardier, 256 connections, HTTP/1.1 keep-alive, 15 s warmup
++ 15 s duration, 13-byte response body, ECDSA P-256 certificate, TLS 1.3.
+**Units:** requests/sec (median of 2 runs per point); Δ is tlssession relative to sslstream.
+
+| server cores | Linux sslstream (req/s) | Linux tlssession (req/s) | **Linux Δ** | Windows sslstream (req/s) | Windows tlssession (req/s) | **Windows Δ** |
 |---|---|---|---|---|---|---|
 | 2 | 112,174 | 122,749 | **+9.4%** | 96,328 | 108,608 | **+12.7%** |
 | 4 | 199,586 | 215,574 | **+8.0%** | 176,698 | 201,447 | **+14.0%** |
 | 8 | 329,065 | 356,752 | **+8.4%** | 317,537 | 359,990 | **+13.4%** |
 | 56 (whole machine) | 727,236 | 728,515 | +0.2% | not measured | | |
 
-Zero bad responses in every run. The PoC also wins on latency and uses equal or slightly
-less CPU at every point — e.g. Windows 8 cores: p99 **1.31 ms vs 1.56 ms** at 741% vs
-764% CPU; Linux 4 cores: p99 **3.00 ms vs 3.15 ms** at 386% vs 396%.
+Zero bad responses in every run. Latency (p99, ms) and CPU (cores%, where 100% = one core)
+also favour `tlssession`: Windows 8 cores **p99 1.31 ms vs 1.56 ms** at **741% vs 764%**
+CPU; Linux 4 cores **p99 3.00 ms vs 3.15 ms** at **386% vs 396%**.
 
-**The whole-machine result is parity, not a win.** At 56 cores both modes land in a noisy
-720k–800k band (three iterations each, medians 727k vs 729k), so something other than the
-TLS layer is the limit there. Constrain the server and the win appears consistently. An
-earlier single 56-core run showing +14.4% was inside that noise band and should not be
-quoted.
+**The whole-machine result is parity, not a win.** At 56 cores both scenarios land in a
+noisy 720k–800k req/s band (three iterations each, medians 727k vs 729k), so something
+other than the TLS layer limits it there. Constrain the server and the win appears
+consistently. An earlier single 56-core run showing +14.4% was inside that noise band and
+should not be quoted.
 
 ### Response size sweep — where the win comes from
 
-`aspnet-gold-lin`, 8 cores, bombardier 256 connections, `--variable responseSize=N`:
+**Test:** same scenarios, `aspnet-gold-lin-relay`, `--application.cpuSet 0-7` (8 cores),
+`--variable responseSize=N`. Load: bombardier, 256 connections, keep-alive.
+**Units:** requests/sec; throughput in MB/s as reported by the load client.
 
-| response | ssl rps | tls rps | Δ | tls throughput |
+| response body | sslstream (req/s) | tlssession (req/s) | Δ | tlssession (MB/s) |
 |---|---|---|---|---|
-| 13 B (default) | 325,762 | 340,638 | **+4.6%** | 68 MB/s |
-| 1 KB | 344,209 | 367,995 | **+6.9%** | 414 MB/s |
-| 16 KB | 203,619 | 224,445 | **+10.2%** | 3,548 MB/s |
-| 100 KB | 45,411 | 45,471 | +0.1% | 4,456 MB/s |
+| 13 B (default) | 325,762 | 340,638 | **+4.6%** | 68 |
+| 1 KB | 344,209 | 367,995 | **+6.9%** | 414 |
+| 16 KB | 203,619 | 224,445 | **+10.2%** | 3,548 |
+| 100 KB | 45,411 | 45,471 | +0.1% | 4,456 |
 
 The gain peaks at 16 KB — one maximum-size TLS record per response, where avoiding
 `SslStream`'s two buffer copies saves the most per operation.
@@ -94,12 +109,11 @@ The only defensible handshake figure remains `TlsPoc.ServerCost` (−23% server 
 because it measures server-only CPU directly rather than inferring it from a rate. Note it
 was taken on Windows with an ECDSA P-256 certificate.
 
-To get a publishable handshake rate, port this PoC's TLS layer into the standard app
-(`src/BenchmarksApps/TLS/Kestrel` in aspnet/Benchmarks) and run the standard
-`tls-handshakes-kestrel` scenario against it — crank can upload a modified local copy with
-`--application.source.localFolder` plus `--application.project`. That keeps the published
-baseline's methodology, including its resumption handling. The app targets net9.0 today and
-would need retargeting to net11.0 for the sans-IO APIs.
+Handshake rate is not the interesting axis for this change anyway: handshake cost is
+dominated by the certificate signature, so a per-operation saving in the record layer is
+small next to it. The throughput scenarios are where the change shows up. If a handshake
+rate is ever needed, the standard `tls-handshakes-kestrel` scenario in aspnet/Benchmarks is
+the reference (it disables resumption, which is the part this config originally missed).
 
 ### Other measurements (pre-fix, still valid)
 
@@ -111,10 +125,12 @@ would need retargeting to net11.0 for the sans-IO APIs.
 
 ### What the fix changed on Linux
 
-Pre-fix lab numbers, for the record — the PoC was losing badly because of the deadlock,
-not because it was slow (single runs, `--application.cpuSet`):
+Pre-fix lab numbers, for the record — the PoC was losing badly because connections hung,
+not because it was slow. **Test:** scenarios `sslstream` / `tlssession`,
+`aspnet-gold-lin-relay`, `--application.cpuSet`, bombardier 256 connections, single runs.
+**Units:** requests/sec.
 
-| cores | ssl | tls before | tls after |
+| server cores | sslstream (req/s) | tlssession before (req/s) | tlssession after (req/s) |
 |---|---|---|---|
 | 2 | 113,873 | 65,147 | 122,948 |
 | 4 | 196,147 | 100,268 | 213,323 |
@@ -136,9 +152,9 @@ Platform-independent; appears to be worth roughly 5 points on Windows.
 
 ---
 
-## Linux: the deadlock, and how it was found
+## The connection hang, and how it was found
 
-### Root cause
+### Root cause — a bug in this adapter
 
 `TlsBufferSession` buffers ciphertext **inside the session**. If the client's first
 request arrives in the same TCP segment as its final handshake records - which is normal
@@ -148,12 +164,15 @@ during the handshake and holds the request internally.
 `TlsSessionDuplexPipe`'s reader then saw an empty transport buffer and awaited
 `_transport.Input.ReadAsync`. Nothing more was coming: the bytes had already been read
 off the socket and were sitting in the session. The server waited for a request it
-already had, the client waited for a response, and the connection deadlocked until the
+already had, the client waited for a response, and the connection hung until the
 client's timeout (10 s max latency in every single lab run, at every core count).
 
-The API makes this easy to get wrong: there is `DrainPendingOutput` for buffered output,
-but **no equivalent for buffered input** and no way to ask whether the session is holding
-any. Worth raising against the sans-IO API - `TlsBufferSession` is `[Experimental]`.
+This is the adapter's mistake, not a runtime defect. The correct pattern is simply to ask
+the session first: `Read` with an empty source returns whatever is buffered, or
+`produced = 0` if there is nothing, so polling is cheap and always safe. The only thing
+worth passing on to the API owners is that a consumer cannot *query* whether the session
+holds buffered input (there is `DrainPendingOutput` for the output direction), so the poll
+has to be speculative - a docs/sample note, given how quiet the failure mode is.
 
 ### The fix
 
@@ -163,17 +182,20 @@ transport. It only runs on the slow path, so the hot path is unchanged.
 
 ### Why it cost so much throughput
 
-A deadlocked connection was killed by the client and replaced, so the server paid for a
-fresh handshake instead of serving requests. At 256 connections on 2 cores:
+A hung connection was killed by the client and replaced, so the server paid for a fresh
+handshake instead of serving requests.
 
-| | before | after |
+**Test:** local (not lab) - `TLS_MODE=tlssession`, server pinned to 2 physical cores,
+bombardier `-c 256 -d 30s -t 2s --fasthttp`, 13-byte response.
+
+| metric | before fix | after fix |
 |---|---|---|
-| rps | 53,434 | **62,695** |
-| max latency | 10.37 s | **206 ms** |
-| latency stddev | 194 ms | **2.48 ms** |
-| timeouts | 498 | **0** |
-| connections created (256 configured) | 3,062 | **258** |
-| reads per connection | 1.0 | **7,338** |
+| throughput (requests/sec) | 53,434 | **62,695** |
+| max latency (ms) | 10,370 | **206** |
+| latency stddev (ms) | 194 | **2.48** |
+| client timeouts (count) | 498 | **0** |
+| TCP connections created (256 configured) | 3,062 | **258** |
+| transport reads per connection | 1.0 | **7,338** |
 
 That handshake storm is exactly the "uses less CPU but cannot fill the machine" symptom:
 stalled connections generate no work, so the thread pool drained and parked.
@@ -351,10 +373,12 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
 
 ## Next steps
 
-1. Raise the buffered-input gap against the sans-IO TLS API: there is no way to ask
-   whether `TlsBufferSession` is holding ciphertext, and no input counterpart to
-   `DrainPendingOutput`. Any other consumer will hit the same deadlock, so this is worth
-   filing while the API is still `[Experimental]`.
+1. Consider a documentation or sample note for the sans-IO TLS API: a consumer must poll
+   the session (`Read` with an empty source) before waiting on its transport, because the
+   session can hold buffered ciphertext and there is no way to query that. The polling
+   call is cheap and returns `produced = 0` when there is nothing, so this is a usage
+   note rather than an API defect - but it is easy to miss, and the failure mode is a
+   silently hung connection.
 2. Work out what limits the whole-machine (56-core) case, where both TLS layers land at
    the same ~727k rps. The win is consistent whenever the server is core-constrained, so
    the ceiling there is probably the load generator or the network, not Kestrel.
@@ -362,6 +386,18 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
    connection reuse works; they were measuring the bug.
 4. Add a regression test for the coalesced case: a client that sends its first request in
    the same flight as its final handshake records must not stall.
+
+## Platform support and rollout
+
+`TlsSession` / `TlsBufferSession` ship on **Windows, Linux and macOS in .NET 11 RC2**. The
+Android implementation is a pending PR targeting .NET 12. (Reading the file layout in
+dotnet/runtime is misleading here - only `TlsContext.OpenSsl.cs` / `TlsSession.OpenSsl.cs`
+and a `TlsSession.Stub.cs` are obvious in the source tree, but Windows is supported; this
+PoC's Windows lab runs exercise it directly.)
+
+The suggested rollout is therefore to **switch Windows and Linux to the sans-IO path and
+leave the remaining platforms on `SslStream`** until the rest lands. Both platforms in that
+set are measured here.
 
 Known gaps if this ever ships: the middleware bypasses `HttpsConnectionMiddleware`, so
 Kestrel's TLS counters and `ITlsHandshakeFeature` are lost. Integration into
