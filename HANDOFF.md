@@ -11,13 +11,14 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ## TL;DR
 
-* **Both platforms are a win.** On the **standard** `plaintext https` scenario from
-  aspnet/Benchmarks, run twice with this server substituted into the application job:
-  **Linux +10.6%**, **Windows +10.8%** at 8 cores (requests/sec, wrk, `pipeline: 16`),
-  and +4.0% / +1.9% on the whole 56-core machine. On the custom scenarios here
-  (`sslstream` vs `tlssession`, bombardier, 256 connections, 13-byte response):
-  **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores, with lower p99 latency and equal
-  or slightly lower CPU. Zero bad responses throughout.
+* **Official benchmarks, whole machine (the tracked configuration): Linux wins, Windows is
+  flat.** `plaintext https` **+6.1%** / `json https` **+8.1%** on Linux; **+1.9%** /
+  **−0.5%** on Windows. The larger figures below (+13–14% Windows) are from
+  *core-constrained* runs; the margin depends on the server being the bottleneck, and both
+  framings belong together.
+* On the custom scenarios here (`sslstream` vs `tlssession`, bombardier, 256 connections,
+  13-byte response): **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores, with lower p99
+  latency and equal or slightly lower CPU. Zero bad responses throughout.
 * **Linux used to lose 30–57% (requests/sec) because of a bug in this adapter, not in the
   runtime.** `TlsBufferSession` buffers ciphertext internally. When a client's first
   request arrived coalesced with its final handshake flight, those bytes were consumed
@@ -67,6 +68,34 @@ noisy 720k–800k req/s band (three iterations each, medians 727k vs 729k), so s
 other than the TLS layer limits it there. Constrain the server and the win appears
 consistently. An earlier single 56-core run showing +14.4% was inside that noise band and
 should not be quoted.
+
+### Official benchmarks (whole machine — the tracked configuration)
+
+These are the standard scenarios from aspnet/Benchmarks, run with no `cpuSet`, which is how
+the tracked numbers are produced. Our server is substituted into the `application` job via
+`--application.source.localFolder` and run once per `TLS_MODE`; the scenario definition,
+load job and parameters are theirs.
+
+**Units:** requests/sec, median of 2 runs. Zero bad responses in every run.
+
+| scenario | platform | sslstream | tlssession | Δ |
+|---|---|---|---|---|
+| `plaintext https` | Linux | 3,252,116 | 3,449,864 | **+6.1%** |
+| `plaintext https` | Windows | 4,587,248 | 4,675,260 | **+1.9%** |
+| `json https` | Linux | 980,383 | 1,059,690 | **+8.1%** |
+| `json https` | Windows | 1,127,318 | 1,121,504 | **−0.5%** |
+
+Run-to-run spread within each point was under 1.2%, and on the Windows `json` point
+`tlssession` was lower in both iterations, so the small regression there is not noise.
+
+**Read this as: a clear win on Linux, and roughly flat on Windows.** The large Windows
+numbers reported elsewhere in this document (+13–14%) come from *core-constrained* runs;
+on the whole machine, where the tracked benchmarks live, Windows shows no meaningful gain.
+Both statements are true and they should be presented together - the margin depends on
+whether the server is the bottleneck.
+
+`json https` is the more representative of the two: `plaintext https` drives wrk with
+`pipeline: 16`, which amortises per-request overhead and is not typical traffic.
 
 ### Standard scenario: `plaintext https` from aspnet/Benchmarks
 
@@ -370,6 +399,27 @@ no way to express.
 So: read these numbers as an A/B between two TLS layers under identical conditions, not as
 figures comparable to any published benchmark result.
 
+## A second adapter bug: `PipeWriter.UnflushedBytes`
+
+`TlsPipeWriter` did not override `CanGetUnflushedBytes` / `UnflushedBytes`, and the base
+`PipeWriter` implementation throws `NotSupportedException`. `System.Text.Json` queries it to
+decide when to flush, so **any `WriteAsJsonAsync` response returned HTTP 500** on this TLS
+layer, while the same endpoint worked under `sslstream`:
+
+```
+System.NotSupportedException: UnflushedBytes is not supported.
+   at System.IO.Pipelines.PipeWriter.get_UnflushedBytes()
+   at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.Http1OutputProducer.get_UnflushedBytes()
+   at System.Text.Json.Serialization.JsonConverter.ShouldFlush(...)
+```
+
+The writer now tracks bytes written since the last flush and reports them. This was found
+only because the standard `json` scenario needed a `/json` endpoint - every benchmark up to
+that point returned plaintext, so nothing ever asked the writer for unflushed bytes. It is
+a good argument for running a real application against this layer rather than just
+benchmark endpoints, and the same class of gap may exist for other `PipeWriter` /
+`PipeReader` members that Kestrel or middleware can reach.
+
 ## Repo layout
 
 ```
@@ -487,7 +537,10 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
 4. Tune per-connection buffer sizing (`InitialBufferSize`, `_scratch` at `MaxCipherRecord`).
    Resident memory per connection is currently 9–27 KB worse than `SslStream`; nothing here
    has been tuned for footprint.
-5. Add a regression test for the coalesced case: a client that sends its first request in
+5. Audit the rest of the `PipeReader` / `PipeWriter` surface for members Kestrel or
+   middleware can reach. `UnflushedBytes` was missing and broke `WriteAsJsonAsync`; there
+   may be others that plaintext benchmarks never touch.
+6. Add a regression test for the coalesced case: a client that sends its first request in
    the same flight as its final handshake records must not stall.
 
 ## Platform support and rollout

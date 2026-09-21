@@ -575,10 +575,20 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
     {
         private byte[]? _staging;
         private int _staged;
+        private long _unflushed;
+
+        // System.Text.Json (and anything else deciding when to flush) asks the writer how
+        // much is pending. PipeWriter's base implementation throws NotSupportedException,
+        // which surfaced as a 500 from WriteAsJsonAsync once Kestrel's output producer
+        // delegated the call down to here.
+        public override bool CanGetUnflushedBytes => true;
+
+        public override long UnflushedBytes => _unflushed;
 
         public override void Advance(int bytes)
         {
             _staged += bytes;
+            _unflushed += bytes;
 
             if (_staged >= MaxPlaintextRecord)
             {
@@ -601,6 +611,7 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
         public override ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
         {
             FlushStaging();
+            _unflushed = 0;
             return owner._transport.Output.FlushAsync(cancellationToken);
         }
 

@@ -5,6 +5,7 @@
 //   TLS_MODE=tlssession  -> custom connection middleware on TlsBufferSession
 
 using System.Net.Security;
+using System.Text.Json.Serialization;
 using System.Security.Authentication;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -222,8 +223,24 @@ else
 // headers) while letting TLS_MODE choose the TLS layer, which their app cannot do.
 app.MapGet("/plaintext", () => Results.Text("Hello, World!", "text/plain"));
 
+// Likewise for the standard `json` scenarios. Serialisation is real (source-generated) so
+// the per-request work matches theirs rather than being shortcut to a constant.
+app.MapGet("/json", (HttpContext context) =>
+    context.Response.WriteAsJsonAsync(
+        new JsonMessage { message = "Hello, World!" },
+        AppJsonContext.Default.JsonMessage));
+
 // Crank waits on this text, so it must not be printed until the port is actually open.
 app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"Application started. TLS mode: {mode}, port: {port}, bindAny: {bindAny}"));
 
 app.Run();
+
+/// <summary>Payload of the TechEmpower json benchmark.</summary>
+internal sealed class JsonMessage
+{
+    public string message { get; set; } = string.Empty;
+}
+
+[JsonSerializable(typeof(JsonMessage))]
+internal partial class AppJsonContext : JsonSerializerContext;
