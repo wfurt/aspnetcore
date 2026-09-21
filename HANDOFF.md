@@ -11,12 +11,13 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ## TL;DR
 
-* **Both platforms are a win.** Scenario `tlssession` vs `sslstream` in
-  `crank/tlspoc.benchmarks.yml`, measured in **requests/sec** (bombardier, 256
-  connections, 13-byte response): **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores,
-  with lower p99 latency (ms), equal or slightly lower CPU (cores%), and zero bad
-  responses. On the whole 56-core machine it is parity — something other than TLS limits
-  it there.
+* **Both platforms are a win.** On the **standard** `plaintext https` scenario from
+  aspnet/Benchmarks, run twice with this server substituted into the application job:
+  **Linux +10.6%**, **Windows +10.8%** at 8 cores (requests/sec, wrk, `pipeline: 16`),
+  and +4.0% / +1.9% on the whole 56-core machine. On the custom scenarios here
+  (`sslstream` vs `tlssession`, bombardier, 256 connections, 13-byte response):
+  **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores, with lower p99 latency and equal
+  or slightly lower CPU. Zero bad responses throughout.
 * **Linux used to lose 30–57% (requests/sec) because of a bug in this adapter, not in the
   runtime.** `TlsBufferSession` buffers ciphertext internally. When a client's first
   request arrived coalesced with its final handshake flight, those bytes were consumed
@@ -67,6 +68,52 @@ noisy 720k–800k req/s band (three iterations each, medians 727k vs 729k), so s
 other than the TLS layer limits it there. Constrain the server and the win appears
 consistently. An earlier single 56-core run showing +14.4% was inside that noise band and
 should not be quoted.
+
+### Standard scenario: `plaintext https` from aspnet/Benchmarks
+
+The scenario definition does not care which binary backs the `application` job, so the
+standard scenario can be run twice with this PoC's server substituted in, once per TLS
+layer. This keeps the published load methodology (wrk, `pipeline: 16`, plaintext preset
+headers, `/plaintext`) and only varies the TLS implementation.
+
+**Test:** `plaintext.benchmarks.yml`, scenario `https`, unmodified; application job
+replaced via `--application.source.localFolder`. **Units:** requests/sec.
+
+| platform | server cores | sslstream (req/s) | tlssession (req/s) | Δ |
+|---|---|---|---|---|
+| Linux | 8 | 1,426,765 | 1,577,348 | **+10.6%** |
+| Linux | 56 (whole machine) | 3,248,090 | 3,376,937 | **+4.0%** |
+| Windows | 8 | 1,103,177 | 1,222,503 | **+10.8%** |
+| Windows | 56 (whole machine) | 4,563,672 | 4,652,155 | **+1.9%** |
+
+Zero bad responses in all runs. CPU was level between the two layers (Linux 8 cores 786%
+vs 787%; Windows 8 cores 785% vs 777%). As with the custom scenarios, the margin is
+largest when the server is core-constrained and shrinks on the whole machine, where
+something other than the TLS layer limits throughput.
+
+Do not quote latency from this scenario: wrk with pipelining reports p99 as `0.00` in
+several of these runs, so only the request rate is meaningful here.
+
+```bash
+crank --config https://raw.githubusercontent.com/aspnet/Benchmarks/main/scenarios/plaintext.benchmarks.yml \
+      --scenario https --profile aspnet-gold-lin-relay --relay \
+      --application.source.localFolder crank/app \
+      --application.source.project src/TlsPoc.CrankServer/TlsPoc.CrankServer.csproj \
+      --application.framework net11.0 \
+      --application.environmentVariables SERVER_BIND=any \
+      --application.environmentVariables TLS_MODE=tlssession
+```
+
+Three things that cost time here:
+
+* **Do not also pass `aspnet.profiles.yml`.** `plaintext.benchmarks.yml` already imports
+  it; passing it again duplicates the profile's endpoint list, so crank starts *two*
+  application jobs on the same machine and the second fails with
+  "Failed to bind to address https://[::]:5000: address already in use".
+* That job nests the project inside its source, so the override is
+  `--application.source.project`, not `--application.project`.
+* The server must answer the scenario's path, hence the `/plaintext` endpoint in
+  `TlsPoc.CrankServer` returning `Hello, World!` as `text/plain`.
 
 ### Response size sweep — where the win comes from
 
@@ -253,19 +300,20 @@ The benchmarks here are custom (`crank/tlspoc.benchmarks.yml`), not scenarios fr
 aspnet/Benchmarks. That is deliberate and worth stating up front, because it is the first
 thing a reviewer will question.
 
-Every standard HTTPS scenario hardcodes `listenOptions.UseHttps(...)`, so it can only ever
-exercise one TLS layer. Comparing `SslStream` against the sans-IO layer needs both
-reachable in the *same* application, over the same transport, cert and load - which is what
-`TLS_MODE` does here (`sslstream` | `sslpipe` | `tlssession`). `sslpipe` exists purely as a
-control: it runs `SslStream` through the identical custom middleware and `IDuplexPipe` swap,
-so any difference it shows is the harness rather than the TLS layer. That three-way
-comparison is not expressible in a standard scenario.
+Every standard HTTPS scenario hardcodes `listenOptions.UseHttps(...)`, so the app behind it
+can only ever construct `SslStream`. Comparing `SslStream` against the sans-IO layer needs
+both reachable in the *same* application, over the same transport, cert and load - which is
+what `TLS_MODE` does here (`sslstream` | `sslpipe` | `tlssession`). `sslpipe` exists purely
+as a control: it runs `SslStream` through the identical custom middleware and `IDuplexPipe`
+swap, so any difference it shows is the harness rather than the TLS layer.
 
-Reusing a standard scenario would mean uploading a patched copy of its app
-(`--application.source.localFolder` does allow this), which trades one custom artefact for
-another while losing the side-by-side control. Standard HTTPS throughput scenarios do exist
-(`plaintext.benchmarks.yml` and `json.benchmarks.yml` have https variants) and are the right
-target once there is a single TLS implementation to measure rather than two to compare.
+That does **not** mean the standard scenarios are unusable. A crank scenario does not care
+which binary backs the `application` job, so the standard `plaintext https` scenario can be
+run twice with this server substituted in via `--application.source.localFolder`, once per
+`TLS_MODE` - see "Standard scenario" above. That is the more externally meaningful
+measurement, because the load configuration is the published one; the custom scenarios add
+the `sslpipe` control and the response-size and certificate knobs that the standard one has
+no way to express.
 
 So: read these numbers as an A/B between two TLS layers under identical conditions, not as
 figures comparable to any published benchmark result.

@@ -216,6 +216,12 @@ else
     app.MapGet("/", () => "Hello, World!");
 }
 
+// Path and payload of the TechEmpower plaintext benchmark, so this server can be dropped
+// into the standard `plaintext` scenarios from aspnet/Benchmarks with
+// --application.source.localFolder. That keeps their load configuration (wrk, pipelining,
+// headers) while letting TLS_MODE choose the TLS layer, which their app cannot do.
+app.MapGet("/plaintext", () => Results.Text("Hello, World!", "text/plain"));
+
 // Crank waits on this text, so it must not be printed until the port is actually open.
 app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"Application started. TLS mode: {mode}, port: {port}, bindAny: {bindAny}"));
