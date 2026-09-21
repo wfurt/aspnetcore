@@ -24,13 +24,12 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
   into the session during the handshake, and this reader then awaited the transport
   instead of asking the session. The connection hung until the client timed out and
   reconnected, producing a handshake storm that burned the "missing" CPU.
-* **The API itself behaves correctly here**: calling `Read` with an empty source returns
-  `produced = 0` when nothing is buffered, so polling the session is cheap and safe. The
-  fix, `TlsPipeReader.TryDrainSession()`, does exactly that before blocking on the
-  transport, on the slow path only. The only API observation worth passing on is that
-  there is no way to *ask* whether the session holds buffered input (there is
-  `DrainPendingOutput` for the output direction), so a consumer has to poll
-  speculatively - worth a line in the docs or a sample, not a defect.
+* **The API was used incorrectly; it is not missing anything.**
+  `TlsOperationStatus.NeedMoreData` is the session's explicit "fetch more bytes from the
+  peer" signal, and the contract is to keep reading from the session until it returns
+  that. This reader instead stopped when the *transport* buffer looked empty, which is a
+  different condition, so it went to sleep while the session was still holding a record.
+  `TlsPipeReader.TryDrainSession()` now loops on the status as intended.
 * The old "bimodal / 50–60% of SslStream / intermittent 0 rps" observations were all this
   defect, amplified by WSL and shared-VM measurement error.
 * Windows was previously measured at +6–10% *before* this fix existed; the same hang
@@ -135,8 +134,15 @@ That is expected: this design removes *per-connection* objects, not per-request 
 256-connection benchmark cannot show a memory difference. (Heap size vs committed memory
 disagree in direction here, so neither should be quoted on its own.)
 
-**Per-connection footprint is worse, not better.** Measured locally (6-core box, server
-GC, `TlsPoc.LoadClient` holding N connections, RSS sampled 15 s in, minus idle baseline):
+**Per-connection footprint is worse, not better — and it is this adapter's doing.**
+`SslStream` is itself implemented on top of `TlsBufferSession` (`SslStream.TlsSessionWedge.cs`
+routes its hot path through the session, on Linux, FreeBSD and Windows). So this is not two
+TLS engines being compared: it is the same engine with different buffering wrapped around
+it, which is also why per-request allocation comes out identical. Any memory difference is
+therefore attributable to the wrapper, not to the sans-IO design.
+
+Measured locally (6-core box, server GC, `TlsPoc.LoadClient` holding N connections, RSS
+sampled 15 s in, minus idle baseline):
 
 | open connections | sslstream (B/conn) | tlssession (B/conn) | delta |
 |---|---|---|---|
@@ -156,7 +162,8 @@ Caveats: RSS on a server-GC process includes heap slack that is not per-connecti
 and this is a single local box rather than the lab. The direction is consistent across all
 three connection counts, so it should not be dismissed, but the absolute numbers are soft.
 
-Buffer sizing is the obvious lever if this matters — it has not been tuned.
+Since `SslStream` gets by without these buffers over the same session, they are a wrapper
+design question rather than a cost of the approach - see next steps.
 
 ### Response size sweep — where the win comes from
 
@@ -257,18 +264,20 @@ off the socket and were sitting in the session. The server waited for a request 
 already had, the client waited for a response, and the connection hung until the
 client's timeout (10 s max latency in every single lab run, at every core count).
 
-This is the adapter's mistake, not a runtime defect. The correct pattern is simply to ask
-the session first: `Read` with an empty source returns whatever is buffered, or
-`produced = 0` if there is nothing, so polling is cheap and always safe. The only thing
-worth passing on to the API owners is that a consumer cannot *query* whether the session
-holds buffered input (there is `DrainPendingOutput` for the output direction), so the poll
-has to be speculative - a docs/sample note, given how quiet the failure mode is.
+This is the adapter's mistake, not a runtime defect, and the API is not missing anything.
+`TlsOperationStatus.NeedMoreData` means exactly "the session needs more data from the peer
+to make progress", and the contract is to keep reading from the session until it says so.
+A record may be whole or partial and may or may not yield output, which is precisely why
+the session, rather than the transport buffer, has to be the authority. This reader used
+"the transport buffer is empty" as its stop condition instead, so it parked while the
+session still held a complete record.
 
 ### The fix
 
-`TlsPipeReader.TryDrainSession()` pulls plaintext the session already holds, by calling
-`Read` with an empty source, and the reader now does that **before** blocking on the
-transport. It only runs on the slow path, so the hot path is unchanged.
+`TlsPipeReader.TryDrainSession()` reads from the session until it returns
+`NeedMoreData`, and the reader only touches the transport once it sees that status. It
+runs on the slow path only, so the hot path is unchanged. Post-fix, the same local
+bombardier run gives 67,232 req/s with zero errors and no connection churn.
 
 ### Why it cost so much throughput
 
@@ -464,12 +473,12 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
 
 ## Next steps
 
-1. Consider a documentation or sample note for the sans-IO TLS API: a consumer must poll
-   the session (`Read` with an empty source) before waiting on its transport, because the
-   session can hold buffered ciphertext and there is no way to query that. The polling
-   call is cheap and returns `produced = 0` when there is nothing, so this is a usage
-   note rather than an API defect - but it is easy to miss, and the failure mode is a
-   silently hung connection.
+1. Reduce this adapter's per-connection buffering. `SslStream` is itself implemented on
+   `TlsBufferSession` (see `SslStream.TlsSessionWedge.cs`), so the memory difference
+   measured here is not inherent to the sans-IO approach - it is the extra `_plaintext`,
+   `_staging` and `_scratch` buffers this adapter keeps on top of the session for each
+   connection's lifetime. That is where the 9–27 KB/connection regression comes from, and
+   removing or shrinking those buffers is the fix.
 2. Work out what limits the whole-machine (56-core) case, where both TLS layers land at
    the same ~727k rps. The win is consistent whenever the server is core-constrained, so
    the ceiling there is probably the load generator or the network, not Kestrel.
@@ -484,10 +493,11 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
 ## Platform support and rollout
 
 `TlsSession` / `TlsBufferSession` ship on **Windows, Linux and macOS in .NET 11 RC2**. The
-Android implementation is a pending PR targeting .NET 12. (Reading the file layout in
-dotnet/runtime is misleading here - only `TlsContext.OpenSsl.cs` / `TlsSession.OpenSsl.cs`
-and a `TlsSession.Stub.cs` are obvious in the source tree, but Windows is supported; this
-PoC's Windows lab runs exercise it directly.)
+Android implementation is a pending PR targeting .NET 12. Reading the file layout in
+dotnet/runtime is misleading - only `TlsContext.OpenSsl.cs` / `TlsSession.OpenSsl.cs` and a
+`TlsSession.Stub.cs` stand out - but `SslStream.TlsSessionWedge.cs` routes `SslStream`'s own
+hot path through `TlsSession` on Linux, FreeBSD and Windows, so the session is already in
+production use on those platforms.
 
 The suggested rollout is therefore to **switch Windows and Linux to the sans-IO path and
 leave the remaining platforms on `SslStream`** until the rest lands. Both platforms in that

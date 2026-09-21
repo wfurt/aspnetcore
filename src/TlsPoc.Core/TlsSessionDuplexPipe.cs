@@ -337,11 +337,8 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
         {
             while (_end <= _examined && !_completed && !_canceled)
             {
-                // TlsBufferSession buffers ciphertext internally, so records that arrived
-                // coalesced with an earlier flight - typically the first request riding along
-                // with the client's final handshake records - are already inside the session
-                // with nothing left in the transport to wake us. Blocking on the transport
-                // here deadlocks until the peer gives up, so drain the session first.
+                // Ask the session first. It reports NeedMoreData when, and only when, more
+                // ciphertext from the peer is actually required.
                 if (TryDrainSession())
                 {
                     break;
@@ -451,8 +448,15 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
         }
 
         /// <summary>
-        /// Pulls plaintext the session already holds, without asking the transport for more.
-        /// Returns true when data was produced or the session reported closure.
+        /// Reads plaintext the session already holds, without touching the transport.
+        ///
+        /// The session - not the transport buffer - decides when more ciphertext is needed:
+        /// it may be holding a whole record, a partial one, or nothing, and a record may or
+        /// may not yield output. <see cref="TlsOperationStatus.NeedMoreData"/> is the only
+        /// status that means "go and fetch more bytes from the peer", so it is the condition
+        /// for falling through to a transport read. Stopping merely because the transport
+        /// buffer was empty is what used to hang connections whose first request arrived in
+        /// the same flight as the client's final handshake records.
         /// </summary>
         private bool TryDrainSession()
         {
@@ -472,27 +476,38 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
                 _end += produced;
                 drained |= produced > 0;
 
-                if (status == TlsOperationStatus.Closed)
+                switch (status)
                 {
-                    _completed = true;
-                    return true;
-                }
+                    case TlsOperationStatus.Closed:
+                        _completed = true;
+                        return true;
 
-                if (status != TlsOperationStatus.DestinationTooSmall)
-                {
-                    return drained;
-                }
-
-                if (produced == 0)
-                {
-                    // A whole record could not fit. Grow once; if that still does not help,
-                    // fall back to the transport rather than spinning here.
-                    if (escalated)
-                    {
+                    case TlsOperationStatus.NeedMoreData:
                         return drained;
-                    }
 
-                    escalated = true;
+                    case TlsOperationStatus.DestinationTooSmall:
+                        // Grow once for a full record; if that still does not fit, fall back
+                        // to the transport rather than spinning here.
+                        if (produced == 0)
+                        {
+                            if (escalated)
+                            {
+                                return drained;
+                            }
+
+                            escalated = true;
+                        }
+
+                        continue;
+
+                    default:
+                        // Complete: the session made progress and may hold another record.
+                        if (produced == 0)
+                        {
+                            return drained;
+                        }
+
+                        continue;
                 }
             }
         }
