@@ -560,12 +560,12 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
    the ceiling there is probably the load generator or the network, not Kestrel.
 3. Re-run the churn scenarios (`sslstream-churn` / `tlssession-churn`) now that
    connection reuse works; they were measuring the bug.
-4. Tune per-connection buffer sizing (`InitialBufferSize`, `_scratch` at `MaxCipherRecord`).
-   Resident memory per connection is currently 9–27 KB worse than `SslStream`; nothing here
-   has been tuned for footprint.
+4. Consider whether `_scratch` (16.9 KB, still held for the connection lifetime) is worth
+   releasing too, once there is a measurement that can actually detect the difference.
 5. Audit the rest of the `PipeReader` / `PipeWriter` surface for members Kestrel or
-   middleware can reach. `UnflushedBytes` was missing and broke `WriteAsJsonAsync`; there
-   may be others that plaintext benchmarks never touch.
+   middleware can reach. `UnflushedBytes` was missing and broke `WriteAsJsonAsync`; the
+   base-class review since then found no other member that throws, but behaviour-only gaps
+   would not show up that way.
 6. Add a regression test for the coalesced case: a client that sends its first request in
    the same flight as its final handshake records must not stall.
 
