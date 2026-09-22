@@ -29,27 +29,109 @@ The real integration into `HttpsConnectionMiddleware`, 10 commits. Contains:
 
 ### State of that branch
 
-| `HttpsConnectionMiddlewareTests` | result |
+**Update.** The renegotiation blocker was not a defect in the adapter. It was the runtime
+the branch is pinned to. See "The renegotiation blocker was a runtime pin" below.
+
+| suite (sans-IO switch on) | result |
 |---|---|
-| switch off (default) | **55 passed, 0 failed** - default path unaffected |
-| switch on | **47 passed, 8 failed** |
+| `InMemory.FunctionalTests` (whole assembly) | **1655 passed, 1 failed** |
+| `Sockets.FunctionalTests` | **92 passed, 0 failed** |
+| `Interop.FunctionalTests` | **447 passed, 1 failed** |
+| `HttpsConnectionMiddlewareTests`, switch off | **55 passed, 0 failed** - default path unaffected |
 
-The 8: five around renegotiation / delayed client certificate, plus
-`ServerCertificateChainInExtraStore`, `SslStreamIsAvailable`, and
-`CanRenegotiateForClientCertificate(Http1AndHttp2)`.
+The 2 remaining failures are the same gap: `SslStreamIsAvailable` and
+`Http2RequestTests.GET_Metrics_HttpProtocolAndTlsSet` both read `ISslStreamFeature.SslStream`,
+which this path cannot supply. Both pass on the default path.
 
-### Next step, concretely
+**HTTP/2 is now covered** and works: 447 of 448 Interop tests pass on the sans-IO path,
+including the full h2spec suite. The "HTTP/2 is never exercised" gap recorded under
+"Correctness verification" is closed.
 
-Renegotiation is implemented but does not work, and three speculative rewrites did not fix
-it. Stop guessing: log `status`, `consumed` and `produced` per iteration of the
-post-handshake exchange, run the same test against `SslStream`, and diff the two. That is
-how the original connection hang was found - `consumed=24 produced=62` was the tell - and
-it is what should have been done instead of the third rewrite.
+### The renegotiation blocker was a runtime pin
 
-Then, in order: finish renegotiation, re-benchmark **the integrated path** (every number in
-this document came from the prototype against the shipped framework, not from Kestrel built
-with this change, and the middleware adds metrics, logging and feature snapshots the
-prototype bypassed), and only then decide what the PR claims.
+`RequestClientCertificate` is documented to re-arm the handshake state machine so the caller
+drives the second handshake via `Handshake()`. The instrumentation this document asked for
+produced the tell on the first try:
+
+```
+[PHA] RequestClientCertificate status=Complete written=99 pendingOut=False complete=True
+[PHA] Handshake in=0 status=Complete consumed=0 written=0 complete=True
+[PHA] done remoteCert=<null>
+```
+
+`complete=True` after the request means the session never re-armed, so `Handshake` took the
+"already complete" short-circuit and never read the client's certificate.
+
+The re-arm is guarded by `_postHandshakeAuthActive` in `RequestClientCertificateBufferedCore`.
+That field does not exist in the runtime this branch restores:
+
+| runtime | `_postHandshakeAuthActive` |
+|---|---|
+| `11.0.0-rc.1.26453.108` (what the branch pins, via upstream `main`) | absent |
+| `11.0.0-rc.2.26471.109` | present |
+
+The prototype in this repo pins **RC2** in its `global.json`; the Kestrel branch inherits
+upstream main's **RC1** transport pin. The adapter code was correct the whole time - all four
+renegotiation tests pass unchanged on RC2. The three speculative rewrites could not have
+worked in that tree.
+
+Until upstream flows RC2, run the tests with roll-forward:
+
+```bash
+DOTNET_ROLL_FORWARD=LatestMinor DOTNET_ROLL_FORWARD_TO_PRERELEASE=1 \
+  ./.dotnet/dotnet test ... -p:EnableSansIoTls=true
+```
+
+The same pin means **no integrated-path benchmarking is meaningful in that tree** without the
+override either.
+
+### Defects found and fixed since
+
+1. **Busy spin when the peer closes mid-record.** A client that sends a partial record - or an
+   alert - and disconnects left every loop driving the session spinning: `ReadAsync` returns
+   the same completed buffer forever, the session cannot consume it, and `buffer.IsEmpty` is
+   never true. In the handshake this burned a core until the handshake timeout and then
+   reported the connection as a *timeout* rather than a failure.
+   `ClientAttemptingToUseUnsupportedProtocolIsLoggedAsDebug` is exactly this case; tracing one
+   run of it produced 91 MB of output. Fixed in the handshake, the post-handshake exchange and
+   the reader.
+2. **A rejected client certificate looked like a successful handshake.** Recording a rejected
+   validation result does not fail the call that records it - it makes the *next* session
+   operation throw. The loop exited on `IsHandshakeComplete` before that happened, so the
+   connection was reported as established, tagged with a negotiated protocol and handed to the
+   application. Caught by `Http2Connection_TlsError`.
+3. **`OnAuthenticate` ran once per endpoint, not once per connection**, because the sans-IO
+   path caches one `TlsContext` and that callback is invoked while building it. The first
+   connection's options silently applied to every later connection. That configuration now
+   stays on `SslStream`.
+4. **No `TlsHandshakeStart` event.** The path reported `TlsHandshakeStop` and
+   `TlsHandshakeFailed` without a matching start.
+5. **Drain-guard message mismatch** - the tests assert `SslStream`'s exact wording.
+6. **Dead buffer rental** in `RequestClientCertificateAsync`.
+
+### Integrated-path benchmark
+
+The re-benchmark this document asks for, now run against Kestrel built with the change rather
+than against the prototype. Same binary, same transport, same certificate; `TLS_MODE` picks
+the layer; `samples/TlsBenchApp` on the integration branch. Server pinned to 2 physical cores,
+load generator to 4 others, 256 connections, 13-byte response, TLS 1.3
+(`TLS_AES_256_GCM_SHA384`), runs interleaved to cancel drift.
+
+| metric | SslStream | sans-IO | delta |
+|---|---|---|---|
+| requests/sec, median of 6 | 94,715 | 100,358 | **+6.0%** |
+| server CPU µs/request, median of 3 | 20.27 | 19.21 | **-5.2%** |
+| errors | 0 | 0 | |
+
+Every one of the six sans-IO runs beat its paired `SslStream` run. **Caveat:** server and load
+generator share a host here, which this document records as the single thing that most
+distorted the earlier investigation. Treat it as confirmation that the win survives
+integration - metrics, logging and feature snapshots included - not as a lab-grade number.
+
+Verify the layer under test rather than assuming: `/tlsinfo` reports which layer actually
+served the request. The switch being on does not mean the sans-IO layer ran, because the
+platform allow-list or the capability probe can decline it and fall back to `SslStream`
+silently, and a run that compares `SslStream` against itself will still report a difference.
 
 ### Working in that tree
 
@@ -61,20 +143,36 @@ cd aspnetcore && ./restore.sh                     # ~2 min, puts an SDK in ./.do
     -c Release --filter "FullyQualifiedName~HttpsConnectionMiddlewareTests"                                      # ~4 s
 ```
 
-To exercise the sans-IO path, temporarily add to the test project and revert afterwards:
+The test projects now take the switch as a build property, so no hand-editing is needed:
 
-```xml
-<ItemGroup>
-  <RuntimeHostConfigurationOption Include="Microsoft.AspNetCore.Server.Kestrel.EnableSansIoTls" Value="true" />
-</ItemGroup>
+```bash
+./.dotnet/dotnet test ... -p:EnableSansIoTls=true
 ```
 
 ### Two runtime issues to file
 
-1. **Bug.** `TlsSession.AcceptWithDefaultValidation()` does not populate
-   `X509Chain.ChainPolicy.ExtraStore` with peer-sent intermediates, so chains that validate
-   under `SslStream` fail here. The intermediates are available via `GetRemoteCertificates()`.
-   Repro: `ServerCertificateChainInExtraStore`.
+1. **Bug.** Peer-sent intermediates never reach `X509Chain.ChainPolicy.ExtraStore`, so a
+   validation callback sees an empty extra store where `SslStream` gives it the chain the peer
+   sent. Confirmed still present on `11.0.0-rc.2.26471.109`: same client certificate, same
+   chain, `ExtraStore` count **0 on the sans-IO path vs 3 under `SslStream`**.
+
+   File it against the *capture*, not against `AcceptWithDefaultValidation`, which does seed
+   the store correctly:
+
+   ```csharp
+   if (_externalRemoteCertificates is { Count: > 0 } intermediates)
+       chain.ChainPolicy.ExtraStore.AddRange(intermediates);
+   ```
+
+   The field feeding it is populated in `CaptureRemoteCertificateForExternalValidation` only
+   when the PAL-built chain has `ChainElements.Count > 1`, which does not hold for server-side
+   client-certificate validation on OpenSSL. `GetRemoteCertificates()` reads the same field, so
+   it is empty too and there is **no Kestrel-side workaround**.
+
+   Impact: an application inspecting `ExtraStore` sees nothing, and a server that relies on
+   peer-supplied intermediates rather than locally installed ones cannot build the chain.
+   `ServerCertificateChainInExtraStore` no longer fails, but only because it configures
+   `OnAuthenticate` and therefore now runs on `SslStream`.
 2. **Proposal.** Expose the cipher-suite decomposition. `TlsSession` gives
    `NegotiatedCipherSuite` but not the legacy algorithm/strength values `ITlsHandshakeFeature`
    surfaces, so every consumer replacing `SslStream` must duplicate the runtime's internal
@@ -602,10 +700,13 @@ implementation throws, so there is no second gap of that kind. The remaining
 surface (`CopyToAsync`, `ReadAtLeastAsync`, `AsStream`, `WriteAsync`) is built on the
 members this adapter overrides.
 
-**Not covered:** the endpoint is configured `HttpProtocols.Http1` and advertises only
-`http/1.1` via ALPN, so **HTTP/2 is never exercised** through this middleware. Client
-certificates and renegotiation are likewise untested through Kestrel, though
-`HandshakeAsync` has parameters for both.
+**Not covered by the prototype harness:** the endpoint is configured `HttpProtocols.Http1`
+and advertises only `http/1.1` via ALPN, so HTTP/2 is never exercised *here*. Client
+certificates and renegotiation are likewise untested through this harness.
+
+**All three are now covered on the integration branch** by the existing Kestrel suites run
+with `-p:EnableSansIoTls=true`: HTTP/2 including the full h2spec suite (447 of 448 Interop
+tests), client certificates, and renegotiation. See "State of that branch" above.
 
 ## Repo layout
 
