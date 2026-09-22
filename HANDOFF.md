@@ -109,29 +109,85 @@ override either.
 5. **Drain-guard message mismatch** - the tests assert `SslStream`'s exact wording.
 6. **Dead buffer rental** in `RequestClientCertificateAsync`.
 
-### Integrated-path benchmark
+### Integrated-path benchmark — the lab, by core count
 
-The re-benchmark this document asks for, now run against Kestrel built with the change rather
-than against the prototype. Same binary, same transport, same certificate; `TLS_MODE` picks
-the layer; `samples/TlsBenchApp` on the integration branch. Server pinned to 2 physical cores,
-load generator to 4 others, 256 connections, 13-byte response, TLS 1.3
-(`TLS_AES_256_GCM_SHA384`), runs interleaved to cancel drift.
+The re-benchmark this document asks for, finally run against Kestrel built with the change
+rather than against the prototype. Lab access works without VPN: the relay profiles
+authenticate through the Azure CLI, so `--profile aspnet-gold-lin-relay --relay` with an
+`az login` session is enough.
 
-| metric | SslStream | sans-IO | delta |
-|---|---|---|---|
-| requests/sec, median of 6 | 94,715 | 100,358 | **+6.0%** |
-| server CPU µs/request, median of 3 | 20.27 | 19.21 | **-5.2%** |
-| errors | 0 | 0 | |
+**How the integrated build gets into the lab.** crank publishes self-contained by default, so
+every framework assembly is app-local and `options.outputFiles` can overlay the Kestrel
+assembly built from the integration branch on top of the published output. The app sets the
+AppContext switch from `TLS_MODE` before the first connection is accepted, which is what makes
+a same-binary A/B possible; no standard scenario can do this, because the app behind it can
+only ever construct `SslStream`. The lab installs **rc.2.26471.109**, so the post-handshake
+re-arm is present there even though the branch's own restore pins RC1.
 
-Every one of the six sans-IO runs beat its paired `SslStream` run. **Caveat:** server and load
-generator share a host here, which this document records as the single thing that most
-distorted the earlier investigation. Treat it as confirmation that the win survives
-integration - metrics, logging and feature snapshots included - not as a lab-grade number.
+Both scenarios use `wrk` with `pipeline: 16` and the plaintext preset, matching the load
+configuration the standard `plaintext https` scenario uses. This matters more than it looks:
+an earlier sweep with non-pipelined bombardier topped out near 600k rps, which capped the
+*load generator* before 28 cores and buried the TLS difference in the harness. Absolute
+numbers are higher than the table further down because this app is a bare 13-byte endpoint
+rather than the TechEmpower plaintext app; read the deltas, not the totals.
 
-Verify the layer under test rather than assuming: `/tlsinfo` reports which layer actually
-served the request. The switch being on does not mean the sans-IO layer ran, because the
-platform allow-list or the capability probe can decline it and fall back to `SslStream`
-silently, and a run that compares `SslStream` against itself will still report a difference.
+Every run verified which layer actually served, via a `/tlsinfo` self-check printed at
+startup - `selfcheck layer=sansio protocol=Tls13`. Without that a sweep can compare
+`SslStream` against itself at every core point and still report a plausible curve.
+
+#### Linux (`aspnet-gold-lin`, 56 cores)
+
+| Server cores | SslStream | sans-IO | Δ |
+|---|---:|---:|---:|
+| 4  | 1,126,631 | 1,193,505 | **+5.9%** |
+| 8  | 1,894,691 | 2,046,188 | **+8.0%** |
+| 16 | 3,179,998 | 3,401,048 | **+7.0%** |
+| 28 | 4,611,237 | 4,552,745 | −1.3% |
+| 56 (whole machine) | 4,345,821 | 4,379,343 | +0.8% |
+
+#### Windows (`aspnet-gold-win`, 56 cores)
+
+| Server cores | SslStream | sans-IO | Δ |
+|---|---:|---:|---:|
+| 4  |   840,694 |   904,418 | **+7.6%** |
+| 8  | 1,582,073 | 1,650,697 | **+4.3%** |
+| 16 | 2,768,876 | 2,858,821 | **+3.2%** |
+| 28 | 4,420,929 | 4,542,828 | **+2.8%** |
+| 56 (whole machine) | 6,062,567 | 6,082,285 | +0.3% |
+
+Single runs except Linux 28, which is a median of 3. Zero bad responses everywhere.
+
+**The shape holds: the win is real where the server is CPU-bound and compresses to nothing as
+the machine approaches its ceiling.** Windows declines monotonically, +7.6% at 4 cores down to
++0.3% at 56. Linux gains +6-8% through 16 cores and then flattens.
+
+**The Linux 28 and 56 rows are a ceiling, not a regression.** Linux peaks near 28 cores on this
+workload and 56 cores is *slower than 28 for both layers* (4,345,821 vs 4,611,237), exactly the
+non-scaling this document recorded before - it simply arrives earlier here because a bare
+13-byte endpoint reaches the ceiling with fewer cores than the TechEmpower app does. At 28
+cores the point does not replicate in either direction: three pairs gave −2.9%, −1.3% and
++3.1%, a six-point spread around zero, which is the run-to-run drift this document already
+warns about at high core counts. Quote it as "within noise", not as a loss.
+
+### Memory — per-connection cost is real, and now measurable
+
+The earlier per-connection claim was retracted because RSS could not resolve it: the same
+5,000-connection point varied by 20 KB/connection across identical runs. Managed heap after a
+forced collection does resolve it. Measured with N connections that each served a request and
+then went idle, so the adapter's return-buffers-when-idle path has already run:
+
+| idle connections | SslStream | sans-IO | difference |
+|---|---:|---:|---:|
+| 2,000 | 14,133 B/conn | 17,987 B/conn | **+27%** |
+| 5,000 |  8,311 B/conn | 10,215 B/conn | **+23%** |
+
+The absolute figures move with N and GC timing; the ~23-27% gap does not. It corroborates the
+lab runs, where the sans-IO application's working set was higher in **all ten** measurements,
+by 15-51 MB.
+
+So the trade is a CPU win for a per-connection memory cost. That is worth stating plainly in
+the PR rather than leaving for a reviewer to find, and it is the one number that argues
+against defaulting this on for connection-heavy workloads.
 
 ### Working in that tree
 
