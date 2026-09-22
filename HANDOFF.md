@@ -21,9 +21,9 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 * On the same standard scenario with the server core-constrained to 8 cores (medians of 3
   runs): **Linux +8.8%**, **Windows +8.3%**. The Linux point is noisy (+5 to +11% across
   runs); Windows is stable to 0.4%.
-* On the custom scenarios here (`sslstream` vs `tlssession`, bombardier, 256 connections,
-  13-byte response): **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores, with lower p99
-  latency and equal or slightly lower CPU. Zero bad responses throughout.
+* On the custom scenarios here (bombardier, 256 connections, 13-byte response):
+  **Linux +8–9%**, **Windows +13–14%** at 2/4/8 cores. These predate the `NeedMoreData`
+  fix and were not re-run; the standard-scenario sweep above supersedes them.
 * **Linux used to lose 30–57% (requests/sec) because of a bug in this adapter, not in the
   runtime.** `TlsBufferSession` buffers ciphertext internally. When a client's first
   request arrived coalesced with its final handshake flight, those bytes were consumed
@@ -56,6 +56,12 @@ Spread within a point was under 1.5% on Windows and under 2% on Linux.
 `--application.cpuSet`. Load: bombardier, 256 connections, HTTP/1.1 keep-alive, 15 s warmup
 + 15 s duration, 13-byte response body, ECDSA P-256 certificate, TLS 1.3.
 **Units:** requests/sec (median of 2 runs per point); Δ is tlssession relative to sslstream.
+
+> **Measured on the pre-`NeedMoreData` build.** These were not re-run after that fix, so
+> treat them as historical. The standard-scenario core sweep above is the current,
+> better-replicated measurement, and it puts Windows at +8–10% rather than +13–14%. The
+> difference is most likely build and load generator (bombardier here, wrk there) rather
+> than anything about the platforms.
 
 | server cores | Linux sslstream (req/s) | Linux tlssession (req/s) | **Linux Δ** | Windows sslstream (req/s) | Windows tlssession (req/s) | **Windows Δ** |
 |---|---|---|---|---|---|---|
@@ -126,11 +132,11 @@ load job and parameters are theirs.
 Run-to-run spread within each point was under 1.2%, and on the Windows `json` point
 `tlssession` was lower in both iterations, so the small regression there is not noise.
 
-**Read the whole-machine row together with the core sweep above.** The large Windows
-numbers reported elsewhere in this document (+13–14%) come from *core-constrained* runs;
-on the whole machine, where the tracked benchmarks live, Windows shows no meaningful gain.
-Both statements are true and they should be presented together - the margin depends on
-whether the server is the bottleneck.
+**Read the whole-machine row together with the core sweep above.** Windows gains +8–10%
+at 4, 8, 16 and 28 cores and only flattens on the whole machine, where Linux stops scaling
+outright and Windows meets some other limit. Quoting the 56-core row on its own understates
+the change; quoting only the constrained rows overstates what the tracked dashboard will
+show. Both belong together.
 
 `json https` is the more representative of the two: `plaintext https` drives wrk with
 `pipeline: 16`, which amortises per-request overhead and is not typical traffic.
