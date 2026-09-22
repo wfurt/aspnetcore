@@ -11,6 +11,11 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ## TL;DR
 
+* **CPU per request drops 7–13%**, consistently across core counts and both platforms —
+  measured exactly at **−13.7%** locally (`/proc` accounting, median of 3) and derived from
+  the lab runs at −6.5% to −13% on Linux and −7.4% to −9.2% on Windows. This holds even
+  where throughput is capped, and matches the earlier `TlsPoc.ServerCost` −10% round-trip
+  figure. The exception is Windows at 56 cores, where the saving disappears (−1.3%).
 * **The gain is +8–14% from 4 to 28 cores on both platforms.** Only the whole-machine
   (56-core) configuration is different, and not because of TLS: Linux does not scale past
   ~28 cores on this workload (56 cores is slower than 28 for *both* layers), and Windows
@@ -79,6 +84,46 @@ noisy 720k–800k req/s band (three iterations each, medians 727k vs 729k), so s
 other than the TLS layer limits it there. Constrain the server and the win appears
 consistently. An earlier single 56-core run showing +14.4% was inside that noise band and
 should not be quoted.
+
+### CPU per request — the efficiency result
+
+Throughput is capped by whatever the bottleneck happens to be, but CPU per request is a
+property of the work itself, so it holds up where the rps numbers flatten.
+
+**Exact measurement**, local 6-core box, server pinned to 2 physical cores, bombardier 256
+connections, CPU taken from `/proc/<pid>/stat` (utime+stime) across the measured window:
+
+| iteration | sslstream | tlssession | reduction |
+|---|---|---|---|
+| 1 | 36.61 µs/req | 32.04 µs/req | −12.5% |
+| 2 | 33.80 µs/req | 28.71 µs/req | −15.1% |
+| 3 | 33.52 µs/req | 29.16 µs/req | −13.0% |
+| **median** | **33.80** | **29.16** | **−13.7%** |
+
+**Derived from the lab runs** as `(cores% / 100) × 10⁶ / rps`, on the standard
+`plaintext https` and `json https` scenarios:
+
+| run | Linux ssl | Linux tls | Linux Δ | Windows ssl | Windows tls | Windows Δ |
+|---|---|---|---|---|---|---|
+| plaintext, 4 cores | 5.02 | 4.37 | **−13.0%** | 6.72 | 6.14 | **−8.6%** |
+| plaintext, 8 cores | 5.58 | 5.22 | **−6.5%** | 6.98 | 6.46 | **−7.4%** |
+| plaintext, 16 cores | 7.09 | 6.40 | **−9.7%** | 7.53 | 6.91 | **−8.2%** |
+| plaintext, 28 cores | 8.12 | 7.38 | **−9.1%** | 8.28 | 7.52 | **−9.2%** |
+| plaintext, 56 cores | 16.60 | 15.50 | **−6.6%** | 11.36 | 11.21 | −1.3% |
+| json, 56 cores | 52.27 | 46.94 | **−10.2%** | 44.26 | 43.44 | −1.9% |
+
+(µs of CPU per request. Caveat: crank reports *max* cores usage, which is paired here with
+*mean* rps, so the absolute values are inflated. The ratio between the two layers is the
+meaningful part, since both are measured identically.)
+
+**So the TLS layer costs roughly 7–13% less CPU per request**, consistently across core
+counts and both platforms — which matches the earlier `TlsPoc.ServerCost` round-trip figure
+of −10% measured in cycles.
+
+The exception is Windows at 56 cores, where the CPU saving disappears too (−1.3% / −1.9%),
+not just the throughput gain. Whatever dominates at that scale is swamping the record-layer
+saving rather than merely capping it. On Linux at 56 cores the CPU saving survives (−6.6%
+plaintext, −10.2% json) even though throughput is limited by the machine's scaling ceiling.
 
 ### How core count affects the margin
 
