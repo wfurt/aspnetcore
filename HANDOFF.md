@@ -155,9 +155,7 @@ Three things that cost time here:
 * The server must answer the scenario's path, hence the `/plaintext` endpoint in
   `TlsPoc.CrankServer` returning `Hello, World!` as `text/plain`.
 
-### Memory — no win, and a per-connection regression
-
-Two separate questions, with different answers.
+### Memory — per-request unchanged; per-connection not resolvable with this instrument
 
 **Per-request allocation is unchanged.** From crank counters on the standard `plaintext
 https` scenario, Linux 8 cores, `--application.options.collectCounters true`:
@@ -167,44 +165,33 @@ https` scenario, Linux 8 cores, `--application.options.collectCounters true`:
 | requests/sec | 1,397,158 | 1,555,436 |
 | Max allocation rate (B/sec) | 672,552,256 | 749,783,784 |
 | **derived bytes/request** | **481** | **482** |
-| Max GC heap size (MB) | 52 | 31 |
-| GC committed memory (MB) | 54 | 70 |
-| Max time in GC (%) | 7 | 8 |
 
-That is expected: this design removes *per-connection* objects, not per-request ones, so a
-256-connection benchmark cannot show a memory difference. (Heap size vs committed memory
-disagree in direction here, so neither should be quoted on its own.)
+That is expected, and reinforced by the fact that `SslStream` is itself implemented on
+`TlsBufferSession` (`SslStream.TlsSessionWedge.cs`): both paths drive the same TLS engine,
+so only the buffering around it differs.
 
-**Per-connection footprint is worse, not better — and it is this adapter's doing.**
-`SslStream` is itself implemented on top of `TlsBufferSession` (`SslStream.TlsSessionWedge.cs`
-routes its hot path through the session, on Linux, FreeBSD and Windows). So this is not two
-TLS engines being compared: it is the same engine with different buffering wrapped around
-it, which is also why per-request allocation comes out identical. Any memory difference is
-therefore attributable to the wrapper, not to the sans-IO design.
+**Per-connection footprint could not be measured reliably.** Resident set size was sampled
+with N connections held open, minus idle baseline. Repeating the 5,000-connection point
+three times on identical code gave deltas of −6.5 KB, +3.9 KB and +13.9 KB per connection,
+with `sslstream` alone ranging 83,335–94,297 B/conn. The instrument cannot resolve a
+difference of this size, so **no per-connection memory claim should be made in either
+direction**. An earlier version of this document reported a 9–27 KB/connection regression;
+that was derived from one sample per point and does not survive repetition.
 
-Measured locally (6-core box, server GC, `TlsPoc.LoadClient` holding N connections, RSS
-sampled 15 s in, minus idle baseline):
+Measuring this properly needs something that separates live per-connection state from GC
+slack and `ArrayPool` retention — a heap snapshot with the connections open, or an
+in-process counter, rather than RSS.
 
-| open connections | sslstream (B/conn) | tlssession (B/conn) | delta |
-|---|---|---|---|
-| 1,000 | 125,243 | 151,994 | **+26.8 KB** |
-| 5,000 | 96,932 | 113,715 | **+16.8 KB** |
-| 10,000 | 81,867 | 90,792 | **+8.9 KB** |
+**What was changed anyway.** The reader now returns its plaintext array to the pool when
+nothing is buffered (in `AdvanceTo`, once `_start >= _end`), and the writer returns its
+staging array after each flush. Previously both were held for the whole connection
+lifetime, up to `MaxPlaintextRecord` (16 KB) each, so a keep-alive connection sitting idle
+between requests retained them for nothing. This is a first-principles improvement rather
+than a measured one; throughput was unaffected (62,119 and 65,610 req/s on the local
+256-connection test, against 59,340 and 67,232 before, i.e. inside the same spread).
 
-The cause is that each connection holds pooled buffers for its whole lifetime:
-`_plaintext` and `_staging` start at `InitialBufferSize` (4 KB) and grow towards
-`MaxPlaintextRecord` (16 KB), and `_scratch` is rented at `MaxCipherRecord` (16.9 KB) the
-first time a read has to be linearised. `ArrayPool` rentals are not *allocations* once the
-pool is warm, which is why the BenchmarkDotNet pairing matrix reports a small allocation
-win (−1.78 KB/connection) while resident memory goes the other way. Both are true; they
-measure different things, and the resident figure is the one that matters at scale.
-
-Caveats: RSS on a server-GC process includes heap slack that is not per-connection state,
-and this is a single local box rather than the lab. The direction is consistent across all
-three connection counts, so it should not be dismissed, but the absolute numbers are soft.
-
-Since `SslStream` gets by without these buffers over the same session, they are a wrapper
-design question rather than a cost of the approach - see next steps.
+`_scratch`, rented at `MaxCipherRecord` (16.9 KB) on the first read that needs
+linearising, is still held for the connection's lifetime.
 
 ### Response size sweep — where the win comes from
 
@@ -259,7 +246,7 @@ the reference (it disables resumption, which is the part this config originally 
 |---|---|---|
 | Handshake CPU | **−23%** (602 -> 465 kcycles) | `TlsPoc.ServerCost` (QueryThreadCycleTime) |
 | Round-trip CPU | **−10%** (151.8 -> 136.4 kcycles) | `TlsPoc.ServerCost` |
-| Allocation per connection | **−1.78 KB** (server-attributable) — but see "Memory" above: resident memory per connection is *higher* | BenchmarkDotNet pairing matrix |
+| Allocation per connection | **−1.78 KB** (server-attributable); resident per-connection memory could not be measured reliably, see "Memory" | BenchmarkDotNet pairing matrix |
 
 ### What the fix changed on Linux
 
@@ -563,12 +550,11 @@ investigation — identical configs ranged 12.5k–51.2k rps. If you use a VM, u
 
 ## Next steps
 
-1. Reduce this adapter's per-connection buffering. `SslStream` is itself implemented on
-   `TlsBufferSession` (see `SslStream.TlsSessionWedge.cs`), so the memory difference
-   measured here is not inherent to the sans-IO approach - it is the extra `_plaintext`,
-   `_staging` and `_scratch` buffers this adapter keeps on top of the session for each
-   connection's lifetime. That is where the 9–27 KB/connection regression comes from, and
-   removing or shrinking those buffers is the fix.
+1. Build a per-connection memory measurement that actually resolves. RSS sampling does
+   not: the same 5,000-connection point varied by 20 KB/connection across identical runs.
+   A heap snapshot taken with the connections open, or an in-process counter, would settle
+   whether this adapter's remaining buffering (`_scratch`, still held for the connection
+   lifetime) costs anything against `SslStream`.
 2. Work out what limits the whole-machine (56-core) case, where both TLS layers land at
    the same ~727k rps. The win is consistent whenever the server is core-constrained, so
    the ceiling there is probably the load generator or the network, not Kestrel.

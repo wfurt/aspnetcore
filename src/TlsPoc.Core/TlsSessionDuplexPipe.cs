@@ -421,6 +421,11 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
                 _start = 0;
                 _end = 0;
                 _examined = 0;
+
+                // Nothing buffered: hand the array back rather than holding up to a full
+                // record for the life of a keep-alive connection. Renting again on the next
+                // read costs a thread-local pool hit.
+                ReleaseBuffers();
             }
             else if (_examined < _start)
             {
@@ -612,6 +617,11 @@ public sealed class TlsSessionDuplexPipe : IDuplexPipe, IAsyncDisposable
         {
             FlushStaging();
             _unflushed = 0;
+
+            // The staged plaintext has been encrypted into the transport, so this array is
+            // dead until the next write. Holding it would cost a buffer per idle connection.
+            ReleaseBuffers();
+
             return owner._transport.Output.FlushAsync(cancellationToken);
         }
 
