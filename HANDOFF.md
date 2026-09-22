@@ -11,11 +11,13 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ## TL;DR
 
-* **Official benchmarks, whole machine (the tracked configuration): Linux wins, Windows is
-  flat.** `plaintext https` **+6.1%** / `json https` **+8.1%** on Linux; **+1.9%** /
-  **−0.5%** on Windows. The larger figures below (+13–14% Windows) are from
-  *core-constrained* runs; the margin depends on the server being the bottleneck, and both
-  framings belong together.
+* **The gain is +8–14% from 4 to 28 cores on both platforms.** Only the whole-machine
+  (56-core) configuration is different, and not because of TLS: Linux does not scale past
+  ~28 cores on this workload (56 cores is slower than 28 for *both* layers), and Windows
+  keeps scaling but runs into some other limit. See "How core count affects the margin".
+* **Official benchmarks, whole machine (the tracked configuration):** `plaintext https`
+  **+6.1%** / `json https` **+8.1%** on Linux; **+1.9%** / **−0.5%** on Windows. These are
+  the most conservative numbers in this document, for the reason above.
 * On the same standard scenario with the server core-constrained to 8 cores (medians of 3
   runs): **Linux +8.8%**, **Windows +8.3%**. The Linux point is noisy (+5 to +11% across
   runs); Windows is stable to 0.4%.
@@ -72,6 +74,39 @@ other than the TLS layer limits it there. Constrain the server and the win appea
 consistently. An earlier single 56-core run showing +14.4% was inside that noise band and
 should not be quoted.
 
+### How core count affects the margin
+
+`plaintext https`, both platforms, `--application.cpuSet`. The 8- and 56-core points are
+medians of 3 and 2 runs; 4, 16 and 28 are single runs, so read the *shape* rather than any
+individual figure.
+
+| server cores | Linux ssl | Linux tls | **Linux Δ** | Windows ssl | Windows tls | **Windows Δ** |
+|---|---|---|---|---|---|---|
+| 4 | 792,475 | 905,827 | **+14.3%** | 588,050 | 647,089 | **+10.0%** |
+| 8 | 1,422,683 | 1,547,697 | **+8.8%** | 1,106,796 | 1,198,127 | **+8.3%** |
+| 16 | 2,198,161 | 2,424,305 | **+10.3%** | 2,014,495 | 2,217,010 | **+10.1%** |
+| 28 | 3,332,141 | 3,615,749 | **+8.5%** | 3,238,685 | 3,521,823 | **+8.7%** |
+| 56 (whole machine) | 3,252,116 | 3,449,864 | **+6.1%** | 4,587,248 | 4,675,260 | **+1.9%** |
+
+**The gain is a steady +8–14% from 4 to 28 cores on both platforms.** Only the
+whole-machine point is different, and it is different for a reason that has nothing to do
+with TLS:
+
+* **Linux does not scale past ~28 cores on this workload.** 56 cores is *slower* than 28 for
+  both layers (`sslstream` 3,252,116 vs 3,332,141; `tlssession` 3,449,864 vs 3,615,749).
+  Once the machine is past its scaling peak, both layers are limited by the same thing and
+  the TLS difference is squeezed.
+* **Windows does keep scaling** (3.24M at 28 cores to 4.59M at 56), but the margin collapses
+  to +1.9% there, so something else becomes the constraint at that rate.
+
+Neither side is starved: at the whole machine the application uses about 5,000–5,400% of a
+possible 5,600% CPU, and the load generator sits at 51–66%. On Windows `json` at 56 cores
+`tlssession` actually uses *less* CPU than `sslstream` (4,852% vs 4,972%) for slightly
+fewer requests - it is more efficient per request but cannot convert that into throughput.
+
+So "Windows shows no benefit" is only true of the 56-core configuration. Windows gains
++8–10% everywhere below that, in line with Linux.
+
 ### Official benchmarks (whole machine — the tracked configuration)
 
 These are the standard scenarios from aspnet/Benchmarks, run with no `cpuSet`, which is how
@@ -91,7 +126,7 @@ load job and parameters are theirs.
 Run-to-run spread within each point was under 1.2%, and on the Windows `json` point
 `tlssession` was lower in both iterations, so the small regression there is not noise.
 
-**Read this as: a clear win on Linux, and roughly flat on Windows.** The large Windows
+**Read the whole-machine row together with the core sweep above.** The large Windows
 numbers reported elsewhere in this document (+13–14%) come from *core-constrained* runs;
 on the whole machine, where the tracked benchmarks live, Windows shows no meaningful gain.
 Both statements are true and they should be presented together - the margin depends on
