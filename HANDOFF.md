@@ -9,6 +9,80 @@ This PoC:        transport pipe -> TlsSessionDuplexPipe (decrypt/encrypt inline)
 
 ---
 
+## Where this is now — two branches
+
+**`kestrel-tlscontext-poc`** (this branch, `wfurt/aspnetcore`)
+Standalone prototype plus every measurement in this document. Not for a PR: it is
+scaffolding, and the benchmark harness here exists to A/B two TLS layers in one process,
+which no standard benchmark can do. Read this document for the numbers and the method.
+
+**`kestrel-sansio-tls`** (`wfurt/aspnetcore`, branched from upstream `main` at `60a812ff`)
+The real integration into `HttpsConnectionMiddleware`, 10 commits. Contains:
+
+* `Internal/TlsSessionDuplexPipe.cs` - the adapter, ported from here
+* `Internal/SansIoTlsSupport.cs` - platform allow-list (Windows/Linux) + capability probe +
+  opt-in `AppContext` switch `Microsoft.AspNetCore.Server.Kestrel.EnableSansIoTls`
+* `Internal/TlsCipherSuiteDecomposition.cs` - legacy cipher mapping copied from the runtime,
+  validated against `SslStream`; wants to move to the runtime source-sharing contract
+* `Internal/TlsConnectionFeature.cs` - session-backed constructor
+* `Middleware/HttpsConnectionMiddleware.cs` - the sans-IO connection path
+
+### State of that branch
+
+| `HttpsConnectionMiddlewareTests` | result |
+|---|---|
+| switch off (default) | **55 passed, 0 failed** - default path unaffected |
+| switch on | **47 passed, 8 failed** |
+
+The 8: five around renegotiation / delayed client certificate, plus
+`ServerCertificateChainInExtraStore`, `SslStreamIsAvailable`, and
+`CanRenegotiateForClientCertificate(Http1AndHttp2)`.
+
+### Next step, concretely
+
+Renegotiation is implemented but does not work, and three speculative rewrites did not fix
+it. Stop guessing: log `status`, `consumed` and `produced` per iteration of the
+post-handshake exchange, run the same test against `SslStream`, and diff the two. That is
+how the original connection hang was found - `consumed=24 produced=62` was the tell - and
+it is what should have been done instead of the third rewrite.
+
+Then, in order: finish renegotiation, re-benchmark **the integrated path** (every number in
+this document came from the prototype against the shipped framework, not from Kestrel built
+with this change, and the middleware adds metrics, logging and feature snapshots the
+prototype bypassed), and only then decide what the PR claims.
+
+### Working in that tree
+
+```bash
+git clone --depth 1 --branch main https://github.com/dotnet/aspnetcore.git
+cd aspnetcore && ./restore.sh                     # ~2 min, puts an SDK in ./.dotnet
+./.dotnet/dotnet build src/Servers/Kestrel/Core/src/Microsoft.AspNetCore.Server.Kestrel.Core.csproj -c Release   # ~16 s
+./.dotnet/dotnet test src/Servers/Kestrel/test/InMemory.FunctionalTests/InMemory.FunctionalTests.csproj \
+    -c Release --filter "FullyQualifiedName~HttpsConnectionMiddlewareTests"                                      # ~4 s
+```
+
+To exercise the sans-IO path, temporarily add to the test project and revert afterwards:
+
+```xml
+<ItemGroup>
+  <RuntimeHostConfigurationOption Include="Microsoft.AspNetCore.Server.Kestrel.EnableSansIoTls" Value="true" />
+</ItemGroup>
+```
+
+### Two runtime issues to file
+
+1. **Bug.** `TlsSession.AcceptWithDefaultValidation()` does not populate
+   `X509Chain.ChainPolicy.ExtraStore` with peer-sent intermediates, so chains that validate
+   under `SslStream` fail here. The intermediates are available via `GetRemoteCertificates()`.
+   Repro: `ServerCertificateChainInExtraStore`.
+2. **Proposal.** Expose the cipher-suite decomposition. `TlsSession` gives
+   `NegotiatedCipherSuite` but not the legacy algorithm/strength values `ITlsHandshakeFeature`
+   surfaces, so every consumer replacing `SslStream` must duplicate the runtime's internal
+   table. Sharing the existing generated table through the runtime↔aspnetcore source-sharing
+   contract would avoid new public API. The DirectTLS effort will hit this too.
+
+---
+
 ## TL;DR
 
 * **CPU per request drops 7–13%**, consistently across core counts and both platforms —
