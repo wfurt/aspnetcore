@@ -664,13 +664,18 @@ dotnet/runtime is misleading - only `TlsContext.OpenSsl.cs` / `TlsSession.OpenSs
 hot path through `TlsSession` on Linux, FreeBSD and Windows, so the session is already in
 production use on those platforms.
 
-The suggested rollout is therefore to **switch Windows and Linux to the sans-IO path and
-leave the remaining platforms on `SslStream`** until the rest lands. Both platforms in that
-set are measured here.
+A rollout that **switches Windows and Linux to the sans-IO path and leaves the remaining
+platforms on `SslStream`** would be a reasonable first step, and both platforms in that set
+are measured here. **This is a proposal, not something implemented:** there is no platform
+conditional anywhere in this prototype. `TLS_MODE` selects the layer explicitly, and both
+platforms ran the identical `tlssession` code path in every measurement above.
 
 Known gaps if this ever ships: the middleware bypasses `HttpsConnectionMiddleware`, so
-Kestrel's TLS counters and `ITlsHandshakeFeature` are lost. Integration into
-dotnet/aspnetcore is also blocked while that repo pins a .NET 10 SDK.
+Kestrel's TLS counters and `ITlsHandshakeFeature` are lost.
+
+`dotnet/aspnetcore` main now pins SDK `11.0.100-rc.1`, so the sans-IO APIs are available
+there and the earlier note in this document about a .NET 10 SDK blocking integration is out
+of date.
 
 ---
 
