@@ -189,6 +189,61 @@ So the trade is a CPU win for a per-connection memory cost. That is worth statin
 the PR rather than leaving for a reviewer to find, and it is the one number that argues
 against defaulting this on for connection-heavy workloads.
 
+### Reproducing the throughput numbers
+
+Use `crank/run-benchmarks.sh`. It handles the traps below automatically; read it before
+hand-rolling a crank command line.
+
+```bash
+az login --use-device-code --allow-no-subscriptions   # once; the lab is reached over Azure Relay
+dotnet tool install -g Microsoft.Crank.Controller --version '0.2.0-*'
+
+./crank/run-benchmarks.sh                    # plaintext https, Linux, whole machine
+./crank/run-benchmarks.sh -c 0-7 -n 3        # 8 cores, 3 iterations, prints medians + delta
+./crank/run-benchmarks.sh -s json -p win -n 2
+```
+
+Verified working: a single 8-core Linux run reproduces `sslstream` 1,420,348 req/s against
+the 1,422,683 median recorded below (0.2% apart).
+
+**Expect noise at 8 cores.** That point has given per-run deltas of +5.5%, +7.0%, +7.1%,
++8.5% and +10.7% on identical code. One run proves nothing there; use `-n 3` and compare
+medians. Windows is far tighter (0.4% spread). If a single run disagrees with this
+document by a few points, that is the expected behaviour of the benchmark, not a
+regression - check against the documented range before concluding anything.
+
+Five things that have each cost a failed or misleading run:
+
+1. **Do not also pass `aspnet.profiles.yml`.** The scenario file already imports it.
+   Passing it again duplicates the profile's endpoints, so crank starts *two* application
+   jobs on one machine and the second dies with "address already in use".
+2. **`--application.source.project`**, not `--application.project` - that job nests
+   `project` inside `source`.
+3. **`SERVER_BIND=any`** is required. The server binds to loopback otherwise, every lab
+   profile drives load from a separate machine, and crank still reports a
+   plausible-looking rps with 100% bad responses. Always check the `Bad responses` row.
+4. **`LC_ALL=C`.** The default locale here is cs_CZ, so .NET's `N0` format uses a space as
+   the thousands separator and every number parsed out of crank's output silently breaks.
+5. **Do not point `DOTNET_ROOT` at this repo's `.dotnet`.** crank and crank-agent target
+   .NET 8 and will not launch against the .NET 11 SDK. The script uses `/usr/lib/dotnet`
+   for the tool and lets crank build the app with its own SDK.
+
+`crank/app` is gitignored, so it is missing on a fresh clone and stale after any source
+edit. The script restages it every run; if you drive crank by hand, restage it yourself:
+
+```bash
+rm -rf crank/app && mkdir -p crank/app/src
+rsync -a --exclude bin --exclude obj src/TlsPoc.CrankServer src/TlsPoc.Core crank/app/src/
+cp Directory.Build.props global.json crank/app/
+```
+
+For the local (non-lab) A/B and the diagnostic harnesses, see `crank/run-benchmarks.sh`
+for the pattern; the local scripts pin the server with `taskset` to physical cores and
+drive it with bombardier from a disjoint set. Check
+`/sys/devices/system/cpu/cpu0/topology/thread_siblings_list` before assuming which CPUs
+are separate cores - on this box siblings are `(0,6) (1,7) ...`, so `taskset -c 0,1` is
+two physical cores, which is *not* true on every machine.
+
 ### Working in that tree
 
 ```bash
